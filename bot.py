@@ -94,7 +94,6 @@ def main():
 
     for item in new_items:
         text = f"{item['date']}: {item['desc']}"
-        )
         bsky_post(access_jwt, did, text)
         print("Posted:", item["id"])
         save_last_id(item["id"])
