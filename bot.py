@@ -93,9 +93,7 @@ def main():
     did = session["did"]
 
     for item in new_items:
-        text = (
-            f"Giants transaction ({item['date']}): {item['desc']}\n\n"
-            "Source: mlb.com/giants/roster/transactions"
+        text = f"{item['date']}: {item['desc']}"
         )
         bsky_post(access_jwt, did, text)
         print("Posted:", item["id"])
