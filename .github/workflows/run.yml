@@ -6,6 +6,10 @@ on:
   workflow_dispatch:        # lets you run it manually with a button
 permissions:
   contents: write
+concurrency:
+  group: giants-transaction-bot
+  cancel-in-progress: true
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
