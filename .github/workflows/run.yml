@@ -2,7 +2,7 @@ name: Giants Transaction Bot
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/15 * * * *"   # every 15 minutes
   workflow_dispatch:
 
 permissions:
@@ -20,7 +20,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # important for git operations
+          fetch-depth: 0
 
       - name: Sync with remote main
         run: |
