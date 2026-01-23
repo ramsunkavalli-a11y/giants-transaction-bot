@@ -2,10 +2,12 @@ name: Giants Transaction Bot
 
 on:
   schedule:
-    - cron: "*/15 * * * *"  # every 15 minutes
-  workflow_dispatch:        # lets you run it manually with a button
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
 permissions:
   contents: write
+
 concurrency:
   group: giants-transaction-bot
   cancel-in-progress: true
@@ -17,6 +19,13 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # important for git operations
+
+      - name: Sync with remote main
+        run: |
+          git fetch origin main
+          git reset --hard origin/main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -34,7 +43,7 @@ jobs:
         run: |
           python bot.py
 
-          - name: Commit updated last_id.txt
+      - name: Commit updated last_id.txt
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -42,7 +51,4 @@ jobs:
           git add last_id.txt
           git commit -m "Update last posted transaction id" || echo "No changes to commit"
 
-          # ✅ Sync before pushing to avoid "fetch first" errors
-          git pull --rebase origin main || true
           git push origin main
-
