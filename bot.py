@@ -1,9 +1,3 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
-diff --git a/bot.py b/bot.py
-index c423117848666136e9fae13df73c61adfef62029..5e01e2fc7a3500dae03a9b5d08e4fb8956d0bd30 100644
---- a/bot.py
-+++ b/bot.py
-@@ -1,59 +1,701 @@
  import os
 +import re
 +import time
