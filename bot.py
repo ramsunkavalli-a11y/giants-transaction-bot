@@ -697,6 +697,31 @@ def save_last_id(last_id: int, path="last_id.txt"):
         f.write(str(int(last_id)))
 
 
+def load_seen_ids(path="seen_ids.txt") -> set[int]:
+    """
+    Rolling set of transaction IDs already handled.
+    Returns an empty set if file is missing/invalid.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = [line.strip() for line in f if line.strip()]
+        return {int(v) for v in raw}
+    except FileNotFoundError:
+        return set()
+    except Exception:
+        return set()
+
+
+def save_seen_ids(ids: set[int], path="seen_ids.txt", keep_last=5000):
+    ordered = sorted(ids)
+    if keep_last and len(ordered) > keep_last:
+        ordered = ordered[-keep_last:]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(str(v) for v in ordered))
+        if ordered:
+            f.write("\n")
+
+
 # ---------- StatsAPI field helpers ----------
 
 def txn_id(t: dict) -> int:
@@ -1015,6 +1040,7 @@ def main():
     app_password = os.environ["BSKY_APP_PASSWORD"]
 
     last_posted_id = load_last_id()
+    seen_ids = load_seen_ids()
 
     # Fetch transactions
     url = mlb_transactions_url()
@@ -1027,10 +1053,18 @@ def main():
         print("No transactions returned.")
         return
 
-    # Only new since last run
-    new_txns = [t for t in txns if txn_id(t) > last_posted_id]
+    # Prefer seen-id dedupe (handles late-arriving transactions with lower IDs).
+    # Fallback to monotonic-ID behavior until seen_ids.txt exists.
+    if seen_ids:
+        new_txns = [t for t in txns if txn_id(t) not in seen_ids]
+    else:
+        new_txns = [t for t in txns if txn_id(t) > last_posted_id]
+
     if not new_txns:
         print("No new transactions.")
+        all_fetched_ids = {txn_id(t) for t in txns if txn_id(t) > 0}
+        if all_fetched_ids:
+            save_seen_ids(seen_ids | all_fetched_ids)
         return
 
     player_cache = {}
@@ -1054,6 +1088,9 @@ def main():
     # Update checkpoint to newest txn id we posted
     new_last_id = max(txn_id(t) for t in new_txns)
     save_last_id(new_last_id)
+    all_fetched_ids = {txn_id(t) for t in txns if txn_id(t) > 0}
+    if all_fetched_ids:
+        save_seen_ids((seen_ids | all_fetched_ids))
     print("Updated last_id.txt to:", new_last_id)
 
 
