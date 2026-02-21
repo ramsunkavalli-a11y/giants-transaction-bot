@@ -16,10 +16,20 @@ PEOPLE_STATS_BY_DATE_RANGE_HYDRATE = "stats(group=[hitting,pitching],type=[byDat
 PEOPLE_STATS_SEASON_HYDRATE = "stats(group=[hitting,pitching],type=[season,seasonAdvanced],season={season})"
 LEVEL_RANK = {"MLB": 7, "AAA": 6, "AA": 5, "A+": 4, "A": 3, "Rk": 2, "CPX": 1, "DSL": 1}
 
+# ---- Hard cutoff: do NOT post anything before this date ----
+TXN_CUTOFF_DATE = datetime.strptime("2026-02-21", "%Y-%m-%d").date()
+
 
 def mlb_transactions_url(days_back=120):
     end_date = datetime.utcnow().date()
     start_date = end_date - timedelta(days=days_back)
+
+    # Avoid fetching earlier than cutoff (and avoid invalid ranges if run before cutoff)
+    if start_date < TXN_CUTOFF_DATE:
+        start_date = TXN_CUTOFF_DATE
+    if start_date > end_date:
+        start_date = end_date
+
     return (
         "https://statsapi.mlb.com/api/v1/transactions"
         f"?teamId={TEAM_ID}&startDate={start_date}&endDate={end_date}"
@@ -407,10 +417,8 @@ def shorten_stat_clause(stat_clause: str, pitcher: bool):
         return None
     parts = stat_clause.split()
     if pitcher:
-        # drop K/BB first for pitchers
         parts = [p for p in parts if "K/BB" not in p]
     else:
-        # drop K% and BB% first for hitters
         parts = [p for p in parts if not p.endswith("%K") and not p.endswith("%BB")]
     out = " ".join(parts).strip()
     return out or None
@@ -545,7 +553,6 @@ def build_signing_post(base_text: str, player_link: str, enrichment: dict, max_l
     if len(post) <= max_len:
         return post
 
-    # Last resort: trim bio line but keep link and base transaction text.
     min_post = f"{base_text}\n{player_link}"
     if len(min_post) >= max_len:
         return min_post[: max_len - 1] + "…"
@@ -585,7 +592,6 @@ def build_post_with_optional_stats(base_text: str, player_link: str, stats_line:
     min_post = f"{base_text}\n{player_link}"
     if len(min_post) <= max_len:
         return min_post
-    # Cannot preserve all constraints if base+link exceeds max; keep base intact and force link tail.
     allowed_link = max(0, max_len - len(base_text) - 1)
     return f"{base_text}\n{player_link[:allowed_link]}"
 
@@ -736,6 +742,18 @@ def txn_date(t: dict) -> str:
     return str(d)[:10]  # YYYY-MM-DD
 
 
+def txn_date_obj(t: dict):
+    """
+    Parse a transaction's effective date into a date() object.
+    Returns None if missing/invalid.
+    """
+    s = txn_date(t)
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
 def txn_desc(t: dict) -> str:
     desc = t.get("description") or t.get("typeDesc") or ""
     return " ".join(str(desc).split()).strip() or "Transaction"
@@ -753,7 +771,6 @@ def is_trade(t: dict) -> bool:
     tc = txn_typecode(t).upper()
     if tc in {"TR", "TRADE"}:
         return True
-    # fallback heuristic
     return " traded " in (" " + txn_desc(t).lower() + " ")
 
 
@@ -783,23 +800,19 @@ def extract_trade_incoming_players(t: dict):
             nm = f"Player {pid}"
         incoming.append({"id": pid, "name": nm})
 
-    # 1) Common shape: a list of "players" with person/fromTeam/toTeam
     candidates = []
     if isinstance(t.get("players"), list):
         candidates.extend(t["players"])
 
-    # 2) Some variants use "playerTransactions" or similar
     if isinstance(t.get("playerTransactions"), list):
         candidates.extend(t["playerTransactions"])
     if isinstance(t.get("playerTransaction"), list):
         candidates.extend(t["playerTransaction"])
 
-    # If we found structured candidates, filter for toTeam == TEAM_ID
     for p in candidates:
         if not isinstance(p, dict):
             continue
 
-        # team routing
         to_team = p.get("toTeam") or p.get("teamTo") or p.get("to") or {}
         to_team_id = (
             (to_team.get("id") if isinstance(to_team, dict) else None)
@@ -825,7 +838,6 @@ def extract_trade_incoming_players(t: dict):
 
         add_player(pid, name)
 
-    # Deduplicate by id, preserve order
     seen = set()
     uniq = []
     for pl in incoming:
@@ -932,11 +944,10 @@ def build_date_group_blocks(txns):
     - Claimed ...
 
     Trade transactions inside this 'other' stream will format as:
-    - Trade (to SF): <desc>
+    - Trade: <desc>
       • Player A https://...
       • Player B https://...
     """
-    # Ensure chronological order
     txns = sorted(txns, key=lambda t: txn_id(t))
 
     blocks = []
@@ -962,19 +973,10 @@ def build_date_group_blocks(txns):
 
         if is_trade(t):
             incoming = extract_trade_incoming_players(t)
-
-            # One-line summary (no repeated date)
             cur_lines.append(f"- Trade: {desc}")
-
-            # Neat incoming list (To-side)
             if incoming:
-                # Use a different bullet to make it visually distinct
                 for pl in incoming:
                     cur_lines.append(f"  • {pl['name']} {player_url(pl['id'])}")
-            else:
-                # If API doesn't provide structured incoming players, we keep it simple
-                # (still posts the trade, just without links)
-                pass
         else:
             cur_lines.append(f"- {desc}")
 
@@ -1028,7 +1030,6 @@ def build_posts(new_txns, player_cache=None, season_mode=False, now_la=None):
         else:
             grouped.append(t)
 
-    # Keep existing grouping behavior for all non-separated transactions.
     other_blocks = build_date_group_blocks(grouped)
     grouped_posts = pack_posts(other_blocks)
 
@@ -1042,7 +1043,6 @@ def main():
     last_posted_id = load_last_id()
     seen_ids = load_seen_ids()
 
-    # Fetch transactions
     url = mlb_transactions_url()
     r = requests.get(url, timeout=20)
     r.raise_for_status()
@@ -1056,9 +1056,22 @@ def main():
     # Prefer seen-id dedupe (handles late-arriving transactions with lower IDs).
     # Fallback to monotonic-ID behavior until seen_ids.txt exists.
     if seen_ids:
-        new_txns = [t for t in txns if txn_id(t) not in seen_ids]
+        candidate_txns = [t for t in txns if txn_id(t) not in seen_ids]
     else:
-        new_txns = [t for t in txns if txn_id(t) > last_posted_id]
+        candidate_txns = [t for t in txns if txn_id(t) > last_posted_id]
+
+    # Hard cutoff: do NOT post anything before 2026-02-21
+    new_txns = []
+    skipped_cutoff = []
+    for t in candidate_txns:
+        d = txn_date_obj(t)
+        if (d is None) or (d < TXN_CUTOFF_DATE):
+            skipped_cutoff.append(t)
+        else:
+            new_txns.append(t)
+
+    if skipped_cutoff:
+        print(f"Skipped {len(skipped_cutoff)} transactions before {TXN_CUTOFF_DATE.isoformat()}.")
 
     if not new_txns:
         print("No new transactions.")
@@ -1075,22 +1088,21 @@ def main():
         print("Nothing to post after formatting.")
         return
 
-    # Login once
     session = bsky_create_session(identifier, app_password)
     access_jwt = session["accessJwt"]
     did = session["did"]
 
-    # Post in order
     for text in posts_to_send:
         bsky_post(access_jwt, did, text)
         print("Posted:\n", text, "\n---")
 
-    # Update checkpoint to newest txn id we posted
     new_last_id = max(txn_id(t) for t in new_txns)
     save_last_id(new_last_id)
+
     all_fetched_ids = {txn_id(t) for t in txns if txn_id(t) > 0}
     if all_fetched_ids:
         save_seen_ids((seen_ids | all_fetched_ids))
+
     print("Updated last_id.txt to:", new_last_id)
 
 
