@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: giants-transaction-bot
-  cancel-in-progress: true
+  cancel-in-progress: false   # don't cancel after posting but before committing state
 
 jobs:
   run-bot:
@@ -21,11 +21,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: true
 
-      - name: Sync with remote main
-        run: |
-          git fetch origin main
-          git reset --hard origin/main
+      # This step is unnecessary (checkout already gets the ref that triggered the workflow),
+      # and hard resets can create confusing states. Remove it.
+      # - name: Sync with remote main
+      #   run: |
+      #     git fetch origin main
+      #     git reset --hard origin/main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -43,12 +46,16 @@ jobs:
         run: |
           python bot.py
 
-      - name: Commit updated last_id.txt
+      - name: Commit bot state (last_id.txt + seen_ids.txt)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add last_id.txt
-          git commit -m "Update last posted transaction id" || echo "No changes to commit"
+          # Make sure we're on main and up to date (prevents push races)
+          git checkout main
+          git pull --rebase origin main
+
+          git add last_id.txt seen_ids.txt
+          git commit -m "Update bot state" || echo "No changes to commit"
 
           git push origin main
