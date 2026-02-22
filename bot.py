@@ -5,21 +5,38 @@ import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+# -----------------------------
+# Config
+# -----------------------------
 TEAM_ID = 137  # SF Giants
 MAX_POST_LEN = 300  # Bluesky post text limit
 REQUEST_TIMEOUT = 20
 REQUEST_RETRIES = 3
 SEASON_CACHE_KEY = "_season_mode"
+
 PEOPLE_BASE_HYDRATE = "currentTeam,education,draft,rosterEntries,transactions"
 PEOPLE_STATS_YEAR_BY_YEAR_HYDRATE = "stats(group=[hitting,pitching],type=[yearByYear])"
-PEOPLE_STATS_BY_DATE_RANGE_HYDRATE = "stats(group=[hitting,pitching],type=[byDateRange],startDate={start},endDate={end},season={season})"
+PEOPLE_STATS_BY_DATE_RANGE_HYDRATE = (
+    "stats(group=[hitting,pitching],type=[byDateRange],startDate={start},endDate={end},season={season})"
+)
 PEOPLE_STATS_SEASON_HYDRATE = "stats(group=[hitting,pitching],type=[season,seasonAdvanced],season={season})"
+
 LEVEL_RANK = {"MLB": 7, "AAA": 6, "AA": 5, "A+": 4, "A": 3, "Rk": 2, "CPX": 1, "DSL": 1}
 
 # ---- Hard cutoff: do NOT post anything before this date ----
-TXN_CUTOFF_DATE = datetime.strptime("2026-02-21", "%Y-%m-%d").date()
+# Optional override via env TXN_CUTOFF_DATE=YYYY-MM-DD
+_CUTOFF_ENV = os.getenv("TXN_CUTOFF_DATE", "2026-02-21").strip()
+TXN_CUTOFF_DATE = datetime.strptime(_CUTOFF_ENV, "%Y-%m-%d").date()
+
+# ---- Persist state next to this script (avoids cwd/path surprises) ----
+STATE_DIR = os.path.dirname(os.path.abspath(__file__))
+LAST_ID_PATH = os.path.join(STATE_DIR, "last_id.txt")
+SEEN_IDS_PATH = os.path.join(STATE_DIR, "seen_ids.txt")
 
 
+# -----------------------------
+# Helpers
+# -----------------------------
 def mlb_transactions_url(days_back=120):
     end_date = datetime.utcnow().date()
     start_date = end_date - timedelta(days=days_back)
@@ -38,7 +55,7 @@ def mlb_transactions_url(days_back=120):
 
 def bsky_create_session(identifier: str, app_password: str):
     url = "https://bsky.social/xrpc/com.atproto.server.createSession"
-    r = requests.post(url, json={"identifier": identifier, "password": app_password}, timeout=20)
+    r = requests.post(url, json={"identifier": identifier, "password": app_password}, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
@@ -110,6 +127,13 @@ def _la_now():
 
 
 def in_season_mode(now_la=None, season_cache=None):
+    """
+    Determine whether we're in regular season or postseason.
+
+    Uses:
+    - seasons endpoint first (preferred)
+    - schedule endpoint as fallback heuristic
+    """
     now_la = now_la or _la_now()
     season_cache = season_cache if season_cache is not None else {}
     cache_key = (SEASON_CACHE_KEY, now_la.date().isoformat())
@@ -125,12 +149,12 @@ def in_season_mode(now_la=None, season_cache=None):
                 continue
             info = seasons[0]
             rs = info.get("regularSeasonStartDate")
-            re = info.get("regularSeasonEndDate")
+            re_ = info.get("regularSeasonEndDate")
             ps = info.get("postSeasonStartDate") or info.get("postseasonStartDate") or rs
-            pe = info.get("postSeasonEndDate") or info.get("postseasonEndDate") or re
-            if rs and re:
+            pe = info.get("postSeasonEndDate") or info.get("postseasonEndDate") or re_
+            if rs and re_:
                 start = datetime.strptime(ps[:10], "%Y-%m-%d").date() if ps else datetime.strptime(rs[:10], "%Y-%m-%d").date()
-                end = datetime.strptime(pe[:10], "%Y-%m-%d").date() if pe else datetime.strptime(re[:10], "%Y-%m-%d").date()
+                end = datetime.strptime(pe[:10], "%Y-%m-%d").date() if pe else datetime.strptime(re_[:10], "%Y-%m-%d").date()
                 if start <= now_la.date() <= end:
                     season_cache[cache_key] = True
                     return True
@@ -310,7 +334,12 @@ def _appearance_volume(split: dict, pitcher: bool):
     st = split.get("stat") or {}
     if pitcher:
         return _safe_float(st.get("inningsPitched")) or 0.0
-    return float(_safe_int(st.get("plateAppearances")) or _safe_int(st.get("atBats")) or _safe_int(st.get("gamesPlayed")) or 0)
+    return float(
+        _safe_int(st.get("plateAppearances"))
+        or _safe_int(st.get("atBats"))
+        or _safe_int(st.get("gamesPlayed"))
+        or 0
+    )
 
 
 def select_last_level_appeared(stats_blocks, pitcher: bool):
@@ -378,7 +407,7 @@ def format_stat_clause(stat: dict, pitcher: bool):
         bb = _safe_int(stat.get("baseOnBalls"))
         era = _safe_float(stat.get("era"))
         if ip is not None:
-            ip_txt = str(int(ip)) if ip.is_integer() else f"{ip:.1f}".rstrip("0").rstrip(".")
+            ip_txt = str(int(ip)) if float(ip).is_integer() else f"{ip:.1f}".rstrip("0").rstrip(".")
             parts.append(f"{ip_txt}IP")
         if so is not None and bb is not None:
             parts.append(f"{so}/{bb}K/BB")
@@ -490,6 +519,7 @@ def build_signing_enrichment(person: dict, stats_blocks=None):
 
     return {
         "name": name,
+        "pitcher": pitcher,
         "clauses": {
             "age": age,
             "school": school,
@@ -504,6 +534,7 @@ def build_signing_enrichment(person: dict, stats_blocks=None):
 def build_signing_post(base_text: str, player_link: str, enrichment: dict, max_len=MAX_POST_LEN):
     name = enrichment.get("name") or "Player"
     clauses = dict(enrichment.get("clauses") or {})
+    pitcher = bool(enrichment.get("pitcher"))
 
     def render(active):
         bio = format_bio_line(name, active)
@@ -536,7 +567,7 @@ def build_signing_post(base_text: str, player_link: str, enrichment: dict, max_l
         if len(post) <= max_len:
             return post
 
-    short_stat = shorten_stat_clause(active.get("stat"), pitcher=("IP" in str(active.get("stat") or "")))
+    short_stat = shorten_stat_clause(active.get("stat"), pitcher=pitcher)
     if short_stat and short_stat != active.get("stat"):
         active["stat"] = short_stat
         post = render(active)
@@ -676,17 +707,23 @@ def bsky_post(access_jwt: str, did: str, text: str):
     if facets:
         record["facets"] = facets
 
-    payload = {
-        "repo": did,
-        "collection": "app.bsky.feed.post",
-        "record": record,
-    }
-    r = requests.post(url, json=payload, headers={"Authorization": f"Bearer {access_jwt}"}, timeout=20)
+    payload = {"repo": did, "collection": "app.bsky.feed.post", "record": record}
+    r = requests.post(url, json=payload, headers={"Authorization": f"Bearer {access_jwt}"}, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
 
-def load_last_id(path="last_id.txt") -> int:
+# -----------------------------
+# State file helpers
+# -----------------------------
+def _atomic_write_text(path: str, content: str):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.replace(tmp, path)
+
+
+def load_last_id(path: str = LAST_ID_PATH) -> int:
     """Numeric transaction id checkpoint. Returns 0 if missing/blank."""
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -698,12 +735,11 @@ def load_last_id(path="last_id.txt") -> int:
         return 0
 
 
-def save_last_id(last_id: int, path="last_id.txt"):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(str(int(last_id)))
+def save_last_id(last_id: int, path: str = LAST_ID_PATH):
+    _atomic_write_text(path, str(int(last_id)))
 
 
-def load_seen_ids(path="seen_ids.txt") -> set[int]:
+def load_seen_ids(path: str = SEEN_IDS_PATH) -> set[int]:
     """
     Rolling set of transaction IDs already handled.
     Returns an empty set if file is missing/invalid.
@@ -718,18 +754,19 @@ def load_seen_ids(path="seen_ids.txt") -> set[int]:
         return set()
 
 
-def save_seen_ids(ids: set[int], path="seen_ids.txt", keep_last=5000):
+def save_seen_ids(ids: set[int], path: str = SEEN_IDS_PATH, keep_last=5000):
     ordered = sorted(ids)
     if keep_last and len(ordered) > keep_last:
         ordered = ordered[-keep_last:]
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(str(v) for v in ordered))
-        if ordered:
-            f.write("\n")
+    txt = "\n".join(str(v) for v in ordered)
+    if ordered:
+        txt += "\n"
+    _atomic_write_text(path, txt)
 
 
-# ---------- StatsAPI field helpers ----------
-
+# -----------------------------
+# StatsAPI field helpers
+# -----------------------------
 def txn_id(t: dict) -> int:
     try:
         return int(t.get("id", 0))
@@ -774,8 +811,9 @@ def is_trade(t: dict) -> bool:
     return " traded " in (" " + txn_desc(t).lower() + " ")
 
 
-# ---------- Trade incoming player extraction ----------
-
+# -----------------------------
+# Trade incoming player extraction
+# -----------------------------
 def _coerce_int(x):
     try:
         return int(x)
@@ -848,8 +886,9 @@ def extract_trade_incoming_players(t: dict):
     return uniq
 
 
-# ---------- Post construction helpers ----------
-
+# -----------------------------
+# Post construction helpers
+# -----------------------------
 def split_oversized_date_block(block: str, max_len=MAX_POST_LEN):
     """Split a date-group block on transaction boundaries to avoid mid-line truncation."""
     if len(block) <= max_len:
@@ -1036,6 +1075,9 @@ def build_posts(new_txns, player_cache=None, season_mode=False, now_la=None):
     return [p for p in (grouped_posts + separate_posts) if p and p.strip()]
 
 
+# -----------------------------
+# Main
+# -----------------------------
 def main():
     identifier = os.environ["BSKY_IDENTIFIER"]
     app_password = os.environ["BSKY_APP_PASSWORD"]
@@ -1043,24 +1085,27 @@ def main():
     last_posted_id = load_last_id()
     seen_ids = load_seen_ids()
 
+    # Helpful run-time visibility (shows up in Actions logs)
+    print("State paths:", LAST_ID_PATH, SEEN_IDS_PATH)
+    print("Loaded last_id:", last_posted_id)
+    print("Loaded seen_ids:", len(seen_ids), ("max=" + str(max(seen_ids)) if seen_ids else ""))
+
     url = mlb_transactions_url()
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    data = r.json()
+    data = request_json_with_retry(url)
     txns = data.get("transactions", [])
 
     if not txns:
         print("No transactions returned.")
         return
 
-    # Prefer seen-id dedupe (handles late-arriving transactions with lower IDs).
-    # Fallback to monotonic-ID behavior until seen_ids.txt exists.
-    if seen_ids:
-        candidate_txns = [t for t in txns if txn_id(t) not in seen_ids]
-    else:
-        candidate_txns = [t for t in txns if txn_id(t) > last_posted_id]
+    # --- Key fix: ALWAYS respect last_id AND seen_ids ---
+    # This prevents repeats even if seen_ids is stale, and still uses seen_ids as a guard.
+    candidate_txns = [
+        t for t in txns
+        if txn_id(t) > last_posted_id and txn_id(t) not in seen_ids
+    ]
 
-    # Hard cutoff: do NOT post anything before 2026-02-21
+    # Hard cutoff: do NOT post anything before TXN_CUTOFF_DATE
     new_txns = []
     skipped_cutoff = []
     for t in candidate_txns:
@@ -1073,19 +1118,27 @@ def main():
     if skipped_cutoff:
         print(f"Skipped {len(skipped_cutoff)} transactions before {TXN_CUTOFF_DATE.isoformat()}.")
 
+    # Always record what we fetched (helps dedupe even if nothing posts this run)
+    all_fetched_ids = {txn_id(t) for t in txns if txn_id(t) > 0}
+
     if not new_txns:
         print("No new transactions.")
-        all_fetched_ids = {txn_id(t) for t in txns if txn_id(t) > 0}
         if all_fetched_ids:
             save_seen_ids(seen_ids | all_fetched_ids)
+            print("Updated seen_ids.txt (no new posts).")
         return
 
     player_cache = {}
     now_la = _la_now()
     season_mode = in_season_mode(now_la=now_la, season_cache=player_cache)
+
     posts_to_send = build_posts(new_txns, player_cache=player_cache, season_mode=season_mode, now_la=now_la)
     if not posts_to_send:
         print("Nothing to post after formatting.")
+        # Still record fetched IDs so we don't churn forever
+        if all_fetched_ids:
+            save_seen_ids(seen_ids | all_fetched_ids)
+            print("Updated seen_ids.txt (nothing to post after formatting).")
         return
 
     session = bsky_create_session(identifier, app_password)
@@ -1099,9 +1152,8 @@ def main():
     new_last_id = max(txn_id(t) for t in new_txns)
     save_last_id(new_last_id)
 
-    all_fetched_ids = {txn_id(t) for t in txns if txn_id(t) > 0}
     if all_fetched_ids:
-        save_seen_ids((seen_ids | all_fetched_ids))
+        save_seen_ids(seen_ids | all_fetched_ids)
 
     print("Updated last_id.txt to:", new_last_id)
 
