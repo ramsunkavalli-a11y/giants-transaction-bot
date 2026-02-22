@@ -23,13 +23,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      # This step is unnecessary (checkout already gets the ref that triggered the workflow),
-      # and hard resets can create confusing states. Remove it.
-      # - name: Sync with remote main
-      #   run: |
-      #     git fetch origin main
-      #     git reset --hard origin/main
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -48,14 +41,23 @@ jobs:
 
       - name: Commit bot state (last_id.txt + seen_ids.txt)
         run: |
+          set -e
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Make sure we're on main and up to date (prevents push races)
-          git checkout main
-          git pull --rebase origin main
-
+          # Stage first so pull/rebase doesn't fail due to working tree changes
           git add last_id.txt seen_ids.txt
-          git commit -m "Update bot state" || echo "No changes to commit"
+
+          # If nothing changed, stop cleanly
+          if git diff --cached --quiet; then
+            echo "No state changes to commit"
+            exit 0
+          fi
+
+          git commit -m "Update bot state"
+
+          # Integrate remote updates (rare with concurrency, but safe)
+          git pull --rebase origin main
 
           git push origin main
