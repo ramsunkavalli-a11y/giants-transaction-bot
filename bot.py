@@ -14,6 +14,14 @@ REQUEST_TIMEOUT = 20
 REQUEST_RETRIES = 3
 SEASON_CACHE_KEY = "_season_mode"
 
+# Delay between posts (helps reduce “spammy burst” behavior / racey feed rendering)
+# Optional override via env POST_DELAY_SECONDS=2
+_POST_DELAY_ENV = os.getenv("POST_DELAY_SECONDS", "2").strip()
+try:
+    POST_DELAY_SECONDS = float(_POST_DELAY_ENV) if _POST_DELAY_ENV else 2.0
+except Exception:
+    POST_DELAY_SECONDS = 2.0
+
 PEOPLE_BASE_HYDRATE = "currentTeam,education,draft,rosterEntries,transactions"
 PEOPLE_STATS_YEAR_BY_YEAR_HYDRATE = "stats(group=[hitting,pitching],type=[yearByYear])"
 PEOPLE_STATS_BY_DATE_RANGE_HYDRATE = (
@@ -713,6 +721,34 @@ def bsky_post(access_jwt: str, did: str, text: str):
     return r.json()
 
 
+def bsky_verify_record(access_jwt: str, did: str, uri: str):
+    """
+    High-signal check:
+    Immediately try to fetch the created record back from the server.
+    - If this succeeds (200), the post exists server-side at that moment.
+    - If it fails (404/400), something odd happened (or it was removed extremely fast).
+    """
+    if not uri or not isinstance(uri, str):
+        return None, None
+
+    try:
+        # uri shape: at://did/app.bsky.feed.post/<rkey>
+        rkey = uri.rsplit("/", 1)[-1].strip()
+        if not rkey:
+            return None, None
+
+        get_url = "https://bsky.social/xrpc/com.atproto.repo.getRecord"
+        r = requests.get(
+            get_url,
+            params={"repo": did, "collection": "app.bsky.feed.post", "rkey": rkey},
+            headers={"Authorization": f"Bearer {access_jwt}"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        return r.status_code, (r.text[:800] if r.text else "")
+    except Exception as exc:
+        return None, f"verify exception: {exc}"
+
+
 # -----------------------------
 # State file helpers
 # -----------------------------
@@ -1089,6 +1125,7 @@ def main():
     print("State paths:", LAST_ID_PATH, SEEN_IDS_PATH)
     print("Loaded last_id:", last_posted_id)
     print("Loaded seen_ids:", len(seen_ids), ("max=" + str(max(seen_ids)) if seen_ids else ""))
+    print("POST_DELAY_SECONDS:", POST_DELAY_SECONDS)
 
     url = mlb_transactions_url()
     data = request_json_with_retry(url)
@@ -1144,10 +1181,25 @@ def main():
     session = bsky_create_session(identifier, app_password)
     access_jwt = session["accessJwt"]
     did = session["did"]
+    print("Posting as DID:", did)
 
-    for text in posts_to_send:
-        bsky_post(access_jwt, did, text)
+    for i, text in enumerate(posts_to_send):
+        resp = bsky_post(access_jwt, did, text)
+        uri = resp.get("uri")
+        cid = resp.get("cid")
         print("Posted:\n", text, "\n---")
+        print("CreateRecord uri:", uri, "cid:", cid)
+
+        # High-signal verification: immediately read it back
+        status, body_snip = bsky_verify_record(access_jwt, did, uri)
+        print("Verify getRecord status:", status)
+        if status != 200:
+            # This snippet is often very informative (404/400, etc.)
+            print("Verify getRecord body snippet:", body_snip)
+
+        # Small delay between posts (helps avoid bursty behavior and feed caching weirdness)
+        if POST_DELAY_SECONDS and i < len(posts_to_send) - 1:
+            time.sleep(POST_DELAY_SECONDS)
 
     new_last_id = max(txn_id(t) for t in new_txns)
     save_last_id(new_last_id)
