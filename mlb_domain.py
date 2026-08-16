@@ -109,6 +109,95 @@ def _appearance_volume(stat: dict, pitcher: bool) -> float:
     )
 
 
+def _ip_to_outs(value) -> int:
+    if value is None or value == "":
+        return 0
+    text = str(value)
+    try:
+        if "." in text:
+            whole, frac = text.split(".", 1)
+            innings = int(whole or 0)
+            remainder = int(frac[:1] or 0)
+            if remainder in (0, 1, 2):
+                return innings * 3 + remainder
+        return int(float(text)) * 3
+    except Exception:
+        return 0
+
+
+def _outs_to_ip(outs: int) -> str:
+    innings, remainder = divmod(max(0, int(outs)), 3)
+    return f"{innings}.{remainder}"
+
+
+def _sum_int(stats, key: str) -> int:
+    return sum(infra._safe_int(stat.get(key)) or 0 for stat in stats)
+
+
+def _combine_hitting_stats(stats: list[dict]) -> dict:
+    pa = _sum_int(stats, "plateAppearances")
+    ab = _sum_int(stats, "atBats")
+    hits = _sum_int(stats, "hits")
+    doubles = _sum_int(stats, "doubles")
+    triples = _sum_int(stats, "triples")
+    home_runs = _sum_int(stats, "homeRuns")
+    walks = _sum_int(stats, "baseOnBalls")
+    strikeouts = _sum_int(stats, "strikeOuts")
+    hbp = _sum_int(stats, "hitByPitch")
+    sac_flies = _sum_int(stats, "sacFlies")
+    games = _sum_int(stats, "gamesPlayed")
+
+    singles = max(0, hits - doubles - triples - home_runs)
+    avg = hits / ab if ab else 0.0
+    obp_denom = ab + walks + hbp + sac_flies
+    obp = (hits + walks + hbp) / obp_denom if obp_denom else 0.0
+    total_bases = singles + 2 * doubles + 3 * triples + 4 * home_runs
+    slg = total_bases / ab if ab else 0.0
+
+    return {
+        "plateAppearances": pa,
+        "atBats": ab,
+        "gamesPlayed": games,
+        "hits": hits,
+        "doubles": doubles,
+        "triples": triples,
+        "homeRuns": home_runs,
+        "baseOnBalls": walks,
+        "strikeOuts": strikeouts,
+        "hitByPitch": hbp,
+        "sacFlies": sac_flies,
+        "avg": f"{avg:.3f}",
+        "obp": f"{obp:.3f}",
+        "slg": f"{slg:.3f}",
+    }
+
+
+def _combine_pitching_stats(stats: list[dict]) -> dict:
+    outs = sum(_ip_to_outs(stat.get("inningsPitched")) for stat in stats)
+    hits = _sum_int(stats, "hits")
+    earned_runs = _sum_int(stats, "earnedRuns")
+    strikeouts = _sum_int(stats, "strikeOuts")
+    walks = _sum_int(stats, "baseOnBalls")
+    games = _sum_int(stats, "gamesPitched") or _sum_int(stats, "gamesPlayed")
+    innings = outs / 3 if outs else 0.0
+    era = earned_runs * 9 / innings if innings else 0.0
+
+    return {
+        "inningsPitched": _outs_to_ip(outs),
+        "hits": hits,
+        "earnedRuns": earned_runs,
+        "strikeOuts": strikeouts,
+        "baseOnBalls": walks,
+        "gamesPitched": games,
+        "era": f"{era:.2f}",
+    }
+
+
+def _combine_split_stats(splits: list[dict], pitcher: bool) -> dict:
+    stats = [(split.get("stat") or {}) for split in splits]
+    return _combine_pitching_stats(stats) if pitcher else _combine_hitting_stats(stats)
+
+
 def _stats_url(person_id: int, pitcher: bool, sport_id: int, stat_type: str,
                season: int, start_date=None, end_date=None) -> str:
     params = {
@@ -133,8 +222,9 @@ def fetch_player_stat(person_id: int, pitcher: bool, sport_id: int, stat_type: s
 
     Returns ``(selected, request_succeeded)``. The dedicated player-scoped
     endpoint and singular ``sportId`` parameter were verified against real MLB
-    and MiLB 2026 data. For season responses with multiple organizations, the
-    aggregate ``team=None`` split is preferred.
+    and MiLB 2026 data. If StatsAPI supplies a same-level aggregate split it is
+    preferred; otherwise multiple organization splits are combined so a traded
+    or released player is represented by his full level performance.
     """
     cache = cache if cache is not None else {}
     key = (
@@ -156,32 +246,49 @@ def fetch_player_stat(person_id: int, pitcher: bool, sport_id: int, stat_type: s
         cache[key] = result
         return result
 
-    candidates = []
+    splits = []
     for block in data.get("stats") or []:
         for split in block.get("splits") or []:
             if not isinstance(split, dict):
                 continue
             if infra._safe_int(infra._get_in(split, "sport", "id")) != sport_id:
                 continue
-            stat = split.get("stat") or {}
-            volume = _appearance_volume(stat, pitcher)
-            if volume <= 0:
+            if _appearance_volume(split.get("stat") or {}, pitcher) <= 0:
                 continue
-            aggregate_rank = 1 if not split.get("team") else 0
-            candidates.append((aggregate_rank, volume, split))
+            splits.append(split)
 
-    if not candidates:
+    if not splits:
         result = (None, True)
         cache[key] = result
         return result
 
-    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    split = candidates[0][2]
+    aggregate_splits = [split for split in splits if not split.get("team")]
+    if aggregate_splits:
+        aggregate_splits.sort(
+            key=lambda split: _appearance_volume(split.get("stat") or {}, pitcher),
+            reverse=True,
+        )
+        split = aggregate_splits[0]
+        selected_stats = split.get("stat") or {}
+        org_name = None
+    elif len(splits) == 1:
+        split = splits[0]
+        selected_stats = split.get("stat") or {}
+        org_name = infra._clean_text(infra._get_in(split, "team", "name"))
+    else:
+        # byDateRange often returns one split per organization but no combined
+        # total. Combine the counting stats and recompute rates ourselves.
+        split = dict(splits[0])
+        split.pop("team", None)
+        selected_stats = _combine_split_stats(splits, pitcher)
+        split["stat"] = selected_stats
+        org_name = None
+
     selected = {
         "seasonYear": infra._safe_int(split.get("season")) or int(season),
-        "orgName": infra._clean_text(infra._get_in(split, "team", "name")),
+        "orgName": org_name,
         "levelToken": SPORT_LEVEL_BY_ID.get(sport_id),
-        "splitStats": split.get("stat") or {},
+        "splitStats": selected_stats,
         "split": split,
     }
     result = (selected, True)
