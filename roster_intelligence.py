@@ -132,32 +132,44 @@ def _is_removal_from_40man(tx: dict, team_id: int, person_id: int) -> bool:
     return False
 
 
-def _generic_40man_state_change(tx: dict):
-    """Return True/False when a transaction clearly establishes 40-man state."""
+def _is_clear_40man_entry(tx: dict) -> bool:
+    """True only for a transaction that independently proves 40-man entry."""
     if domain.is_contract_selected_transaction(tx):
         return True
     if domain.is_claimed_off_waivers_transaction(tx):
+        # MLB's CLW stream is a 40-man waiver claim.  Minor-league assignments
+        # use different transaction types.
         return True
-    if is_d60_return_transaction(tx):
-        return True
-
-    if domain.is_dfa_transaction(tx):
-        return False
-    if domain.is_outrighted_transaction(tx):
-        return False
-    if domain.is_released_transaction(tx):
-        return False
-    if domain.is_declared_free_agency_transaction(tx):
-        return False
-    if is_d60_create_transaction(tx):
-        return False
-
-    # A clearly identified MLB contract creates a 40-man spot. Generic/minor
-    # free-agent signings intentionally remain unknown.
     if domain.is_signing_transaction(tx):
         hay = f"{tx.get('typeDesc','')} {tx.get('description','')}".lower()
-        if "major league contract" in hay:
-            return True
+        return "major league contract" in hay
+    return False
+
+
+def _is_clear_40man_exit(tx: dict) -> bool:
+    return (
+        domain.is_dfa_transaction(tx)
+        or domain.is_outrighted_transaction(tx)
+        or domain.is_released_transaction(tx)
+        or domain.is_declared_free_agency_transaction(tx)
+    )
+
+
+def _generic_40man_state_change(tx: dict, has_40man_anchor: bool = False):
+    """Return state change, guarding against minor-league 60-day IL wording.
+
+    Minor-league clubs also use "60-day injured list" transactions.  Therefore
+    a D60 placement/activation is meaningful for 40-man inference only after a
+    player's history has independently established real 40-man membership.
+    """
+    if _is_clear_40man_entry(tx):
+        return True
+    if _is_clear_40man_exit(tx):
+        return False
+    if has_40man_anchor and is_d60_create_transaction(tx):
+        return False
+    if has_40man_anchor and is_d60_return_transaction(tx):
+        return True
     return None
 
 
@@ -166,8 +178,9 @@ def recent_player_40man_state(person_id: int, before_date, cache=None,
     """Infer 40-man state immediately before a date from transaction history.
 
     Trades, options, recalls and minor-league assignments preserve the last
-    known state. This is deliberately conservative: no clear prior state means
-    no reconciliation.
+    known state. 60-day IL events only affect state after a genuine 40-man
+    entry has been observed, preventing minor-league IL transactions from
+    creating false 40-man membership.
     """
     cache = cache if cache is not None else {}
     before = _as_date(before_date)
@@ -181,11 +194,14 @@ def recent_player_40man_state(person_id: int, before_date, cache=None,
     if not ok:
         return None, False
     state = None
+    has_anchor = False
     for hist in sorted(
         history,
         key=lambda item: (infra.txn_date_obj(item) or date.min, infra.txn_id(item)),
     ):
-        change = _generic_40man_state_change(hist)
+        if _is_clear_40man_entry(hist):
+            has_anchor = True
+        change = _generic_40man_state_change(hist, has_40man_anchor=has_anchor)
         if change is not None:
             state = change
     return state, True
