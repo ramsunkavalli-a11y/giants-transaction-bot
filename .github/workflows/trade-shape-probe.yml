@@ -1,4 +1,4 @@
-name: Trade record consolidation
+name: Trade consolidation live validation
 
 on:
   push:
@@ -6,57 +6,63 @@ on:
       - agent/enrichment-formatting-v1
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  patch:
-    if: github.event.head_commit.message == 'Apply trade record consolidation'
+  validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - name: Apply trade consolidation
+      - name: Validate all real 2026 trade records
         run: |
           python - <<'PY'
-          from pathlib import Path
+          import bot_core as infra
+          import post_builder
 
-          path = Path('bot_core.py')
-          text = path.read_text()
+          data = infra.request_json_with_retry(
+              "https://statsapi.mlb.com/api/v1/transactions"
+              "?teamId=137&startDate=2026-01-01&endDate=2026-08-16"
+          )
+          trades = [
+              tx for tx in (data.get("transactions") or [])
+              if (tx.get("typeCode") or "").upper() == "TR"
+          ]
+          assert len(trades) == 31, len(trades)
+          unique_ids = {infra.txn_id(tx) for tx in trades}
+          assert len(unique_ids) == 12, len(unique_ids)
 
-          old_candidates = '''    candidates = []\n    if isinstance(tx.get("players"), list):\n        candidates.extend(tx["players"])\n'''
-          new_candidates = '''    candidates = []\n    # Real StatsAPI trade feeds emit one top-level transaction row per player\n    # leg, with person/fromTeam/toTeam on the row itself. Older/nested shapes\n    # are still supported below.\n    if (\n        isinstance(tx.get("person"), dict)\n        or isinstance(tx.get("toTeam"), dict)\n        or isinstance(tx.get("fromTeam"), dict)\n    ):\n        candidates.append(tx)\n    if isinstance(tx.get("players"), list):\n        candidates.extend(tx["players"])\n'''
-          if old_candidates not in text:
-              raise SystemExit('trade candidate block not found')
-          text = text.replace(old_candidates, new_candidates, 1)
+          posts = post_builder.build_posts(
+              trades, player_cache={}, season_mode=True
+          )
+          joined = "\n".join(posts)
+          print(joined)
+          assert joined.count("- Trade:") == 12, joined.count("- Trade:")
 
-          marker = '''\n\n# -----------------------------\n# Generic grouped-post construction\n# -----------------------------\n'''
-          helper = '''\n\ndef collapse_trade_records(txns):\n    """Collapse StatsAPI's one-row-per-leg trade shape into one transaction.\n\n    Real trade records share a transaction ID and description but repeat once\n    for each player/cash leg. Merging their structured legs preserves incoming\n    player links while preventing duplicate trade lines.\n    """\n    collapsed = []\n    trade_groups = {}\n\n    for tx in sorted(txns, key=txn_id):\n        if not is_trade(tx):\n            collapsed.append(tx)\n            continue\n\n        trade_id = txn_id(tx)\n        key = ("id", trade_id) if trade_id > 0 else (\n            "fallback", txn_date(tx), txn_desc(tx).strip().lower()\n        )\n        merged = trade_groups.get(key)\n        if merged is None:\n            merged = dict(tx)\n            merged["playerTransactions"] = []\n            trade_groups[key] = merged\n            collapsed.append(merged)\n\n        legs = merged["playerTransactions"]\n        if (\n            isinstance(tx.get("person"), dict)\n            or isinstance(tx.get("toTeam"), dict)\n            or isinstance(tx.get("fromTeam"), dict)\n        ):\n            legs.append({\n                "person": tx.get("person"),\n                "fromTeam": tx.get("fromTeam"),\n                "toTeam": tx.get("toTeam"),\n            })\n\n        for field in ("players", "playerTransactions", "playerTransaction"):\n            nested = tx.get(field)\n            if isinstance(nested, list):\n                legs.extend(item for item in nested if isinstance(item, dict))\n\n    return collapsed\n'''
-          if marker not in text:
-              raise SystemExit('grouping marker not found')
-          text = text.replace(marker, helper + marker, 1)
+          # Arraez/Kilian -> Gair/Marquez
+          desc = "San Francisco Giants traded 2B Luis Arraez and RHP Caleb Kilian to Philadelphia Phillies for RHP Marty Gair and RHP Ramon Marquez."
+          assert joined.count(desc) == 1
+          assert "Marty Gair https://www.mlb.com/player/700248" in joined
+          assert "Ramon Marquez https://www.mlb.com/player/827408" in joined
 
-          old_build = '''def build_date_group_blocks(txns):\n    txns = sorted(txns, key=txn_id)\n'''
-          new_build = '''def build_date_group_blocks(txns):\n    txns = collapse_trade_records(txns)\n'''
-          if old_build not in text:
-              raise SystemExit('build_date_group_blocks start not found')
-          text = text.replace(old_build, new_build, 1)
-          path.write_text(text)
+          # Mayer acquisition
+          desc = "Boston Red Sox traded 2B Marcelo Mayer to San Francisco Giants for LHP Erik Miller and CF Carlos Gutierrez."
+          assert joined.count(desc) == 1
+          assert "Marcelo Mayer https://www.mlb.com/player/691785" in joined
 
-          test_path = Path('tests/test_trade_consolidation.py')
-          test_path.write_text('''import unittest\n\nimport bot_core as infra\n\n\nclass TradeConsolidationTests(unittest.TestCase):\n    def _leg(self, person_id, name, from_id, from_name, to_id, to_name):\n        return {\n            "id": 100,\n            "date": "2026-08-03",\n            "typeCode": "TR",\n            "description": "San Francisco Giants traded two players for two prospects.",\n            "person": {"id": person_id, "fullName": name},\n            "fromTeam": {"id": from_id, "name": from_name},\n            "toTeam": {"id": to_id, "name": to_name},\n        }\n\n    def test_top_level_trade_leg_is_recognized_as_incoming(self):\n        tx = self._leg(700248, "Marty Gair", 143, "Philadelphia Phillies", 137, "San Francisco Giants")\n        self.assertEqual(\n            infra.extract_trade_incoming_players(tx),\n            [{"id": 700248, "name": "Marty Gair"}],\n        )\n\n    def test_same_trade_id_collapses_to_one_line_and_keeps_all_incoming_links(self):\n        records = [\n            self._leg(700248, "Marty Gair", 143, "Philadelphia Phillies", 137, "San Francisco Giants"),\n            self._leg(827408, "Ramon Marquez", 143, "Philadelphia Phillies", 137, "San Francisco Giants"),\n            self._leg(668873, "Caleb Kilian", 137, "San Francisco Giants", 143, "Philadelphia Phillies"),\n            self._leg(650333, "Luis Arraez", 137, "San Francisco Giants", 143, "Philadelphia Phillies"),\n        ]\n        blocks = infra.build_date_group_blocks(records)\n        joined = "\\n".join(blocks)\n        self.assertEqual(joined.count("- Trade:"), 1)\n        self.assertEqual(joined.count("San Francisco Giants traded two players for two prospects."), 1)\n        self.assertIn("Marty Gair https://www.mlb.com/player/700248", joined)\n        self.assertIn("Ramon Marquez https://www.mlb.com/player/827408", joined)\n        self.assertNotIn("Caleb Kilian https://www.mlb.com/player/668873", joined)\n        self.assertNotIn("Luis Arraez https://www.mlb.com/player/650333", joined)\n\n    def test_separate_trade_ids_on_same_date_stay_separate(self):\n        first = self._leg(1, "Incoming One", 143, "Phillies", 137, "Giants")\n        second = self._leg(2, "Incoming Two", 147, "Yankees", 137, "Giants")\n        second["id"] = 101\n        second["description"] = "San Francisco Giants made a second trade."\n        joined = "\\n".join(infra.build_date_group_blocks([first, second]))\n        self.assertEqual(joined.count("- Trade:"), 2)\n        self.assertIn("Incoming One", joined)\n        self.assertIn("Incoming Two", joined)\n\n\nif __name__ == "__main__":\n    unittest.main()\n''')
+          # Ramos -> Lalane/Kent
+          desc = "San Francisco Giants traded LF Heliot Ramos to New York Yankees for LHP Henry Lalane and SS Kaeden Kent."
+          assert joined.count(desc) == 1
+          assert "Henry Lalane https://www.mlb.com/player/700649" in joined
+          assert "Kaeden Kent https://www.mlb.com/player/809763" in joined
+
+          # Cash acquisition still links incoming player.
+          desc = "Detroit Tigers traded RHP Dylan Smith to San Francisco Giants for cash."
+          assert joined.count(desc) == 1
+          assert "Dylan Smith https://www.mlb.com/player/681916" in joined
+
+          print("\nLIVE TRADE CONSOLIDATION PASSED")
           PY
-      - name: Test and commit
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add bot_core.py tests/test_trade_consolidation.py
-          git diff --cached --check
-          python -m py_compile bot_core.py tests/test_trade_consolidation.py
-          python -m unittest tests.test_trade_consolidation -v
-          git commit -m "Consolidate duplicate trade legs"
-          git push origin HEAD:agent/enrichment-formatting-v1
