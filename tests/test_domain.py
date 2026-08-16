@@ -43,6 +43,42 @@ class TransactionSemanticsTests(unittest.TestCase):
         self.assertTrue(domain.is_dfa_transaction(dfa))
         self.assertEqual(domain.classify_transaction(dfa, True), "dfa")
 
+    def test_declared_free_agency_is_not_designated_for_assignment(self):
+        tx = {
+            "typeCode": "DFA",
+            "typeDesc": "Declared Free Agency",
+            "description": "RHP Test Player declared free agency.",
+        }
+        self.assertTrue(domain.is_declared_free_agency_transaction(tx))
+        self.assertFalse(domain.is_dfa_transaction(tx))
+        self.assertIsNone(domain.classify_transaction(tx, True))
+
+    def test_verified_auxiliary_transaction_codes_do_not_change_routing_yet(self):
+        cases = [
+            (domain.is_claimed_off_waivers_transaction, "CLW", "Claimed Off Waivers", "San Francisco Giants claimed RHP Test Player off waivers from Club."),
+            (domain.is_outrighted_transaction, "OUT", "Outrighted", "San Francisco Giants sent RHP Test Player outright to Sacramento River Cats."),
+            (domain.is_released_transaction, "REL", "Released", "San Francisco Giants released RHP Test Player."),
+            (domain.is_reinstated_transaction, "RE", "Reinstated", "San Francisco Giants reinstated RHP Test Player."),
+            (domain.is_acquired_transaction, "ACQ", "Acquired", "San Francisco Giants acquired RHP Test Player from an independent club."),
+            (domain.is_trade_transaction, "TR", "Trade", "San Francisco Giants traded RHP Test Player to Other Club for cash."),
+            (domain.is_number_change_transaction, "NUM", "Number Change", "RHP Test Player changed number to 42."),
+            (domain.is_assigned_transaction, "ASG", "Assigned", "RHP Test Player assigned to San Francisco Giants."),
+        ]
+        for predicate, code, desc, description in cases:
+            with self.subTest(code=code):
+                tx = {"typeCode": code, "typeDesc": desc, "description": description}
+                self.assertTrue(predicate(tx))
+                self.assertIsNone(domain.classify_transaction(tx, True))
+
+    def test_sgn_signed_stream_is_an_explicit_signing(self):
+        tx = {
+            "typeCode": "SGN",
+            "typeDesc": "Signed",
+            "description": "San Francisco Giants signed OF Test Draft Pick.",
+        }
+        self.assertTrue(domain.is_signing_transaction(tx))
+        self.assertEqual(domain.classify_transaction(tx, True), "signing")
+
     def test_offseason_only_signings_are_special(self):
         signing = {
             "typeCode": "SFA",

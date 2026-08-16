@@ -43,7 +43,8 @@ def is_signing_transaction(tx: dict) -> bool:
         return False
 
     # SC is generic "Status Change" (IL/roster moves), not a signing.
-    if tc in {"SFA", "SMC", "S", "FA"}:
+    # SGN is MLB's generic Signed stream (used by 2026 draft signings).
+    if tc in {"SFA", "SGN", "SMC", "S", "FA"}:
         return True
 
     return any(
@@ -71,10 +72,57 @@ def is_recalled_transaction(tx: dict) -> bool:
 def is_dfa_transaction(tx: dict) -> bool:
     tc = (tx.get("typeCode") or "").strip().upper()
     hay = _hay(tx)
-    # DES is the code observed on real 2026 DFA transactions.
-    return tc in {"DES", "DFA"} or (
+    # Official StatsAPI: DES = Designated for Assignment. DFA instead means
+    # Declared Free Agency and must never be interpreted as a designation.
+    return tc == "DES" or (
         "designated" in hay and "for assignment" in hay
     )
+
+
+def is_declared_free_agency_transaction(tx: dict) -> bool:
+    tc = (tx.get("typeCode") or "").strip().upper()
+    return tc == "DFA" or "declared free agency" in _hay(tx)
+
+
+def is_claimed_off_waivers_transaction(tx: dict) -> bool:
+    tc = (tx.get("typeCode") or "").strip().upper()
+    hay = _hay(tx)
+    return tc == "CLW" or ("claimed" in hay and "off waivers" in hay)
+
+
+def is_outrighted_transaction(tx: dict) -> bool:
+    tc = (tx.get("typeCode") or "").strip().upper()
+    return tc == "OUT" or "outright" in _hay(tx)
+
+
+def is_released_transaction(tx: dict) -> bool:
+    tc = (tx.get("typeCode") or "").strip().upper()
+    return tc == "REL" or "released" in _hay(tx)
+
+
+def is_reinstated_transaction(tx: dict) -> bool:
+    tc = (tx.get("typeCode") or "").strip().upper()
+    return tc == "RE" or "reinstated" in _hay(tx)
+
+
+def is_acquired_transaction(tx: dict) -> bool:
+    tc = (tx.get("typeCode") or "").strip().upper()
+    hay = _hay(tx)
+    return tc == "ACQ" or ("acquired" in hay and "traded" not in hay)
+
+
+def is_trade_transaction(tx: dict) -> bool:
+    tc = (tx.get("typeCode") or "").strip().upper()
+    return tc == "TR" or "traded" in _hay(tx)
+
+
+def is_number_change_transaction(tx: dict) -> bool:
+    tc = (tx.get("typeCode") or "").strip().upper()
+    return tc == "NUM" or "changed number" in _hay(tx)
+
+
+def is_assigned_transaction(tx: dict) -> bool:
+    return (tx.get("typeCode") or "").strip().upper() == "ASG"
 
 
 def classify_transaction(tx: dict, season_mode: bool) -> str | None:
