@@ -1,0 +1,44 @@
+name: Trade shape probe
+
+on:
+  push:
+    branches:
+      - agent/enrichment-formatting-v1
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Inspect real trade records
+        run: |
+          python - <<'PY'
+          from collections import defaultdict
+          import json
+          import bot_core as infra
+
+          data = infra.request_json_with_retry(
+              "https://statsapi.mlb.com/api/v1/transactions"
+              "?teamId=137&startDate=2026-01-01&endDate=2026-08-16"
+          )
+          txns = [tx for tx in (data.get("transactions") or []) if (tx.get("typeCode") or "").upper() == "TR"]
+          groups = defaultdict(list)
+          for tx in txns:
+              groups[(tx.get("date"), tx.get("description"))].append(tx)
+
+          print("TR RECORDS", len(txns), "UNIQUE DATE+DESC", len(groups))
+          for (day, desc), records in sorted(groups.items()):
+              print("\n===", day, "records", len(records))
+              print(desc)
+              for tx in records:
+                  compact = {k: tx.get(k) for k in ("id", "person", "fromTeam", "toTeam", "players", "playerTransactions", "playerTransaction") if tx.get(k) is not None}
+                  print(json.dumps(compact, sort_keys=True))
+                  print("existing incoming", infra.extract_trade_incoming_players(tx))
+          PY
