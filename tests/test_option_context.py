@@ -25,13 +25,14 @@ class OptionHitterFormattingTests(unittest.TestCase):
             "MLB since Jul 10",
             self.selected,
             usage={"games": 23, "starts": 13},
+            woba=0.197954,
             xwoba=0.295618,
         )
         self.assertIn(
             "MLB since Jul 10: 23 G (13 GS), 47 PA, .081/.227/.162 (.389 OPS)",
             post,
         )
-        self.assertIn(".296 xwOBA | 28 K% | 15 BB%", post)
+        self.assertIn(".198 wOBA / .296 xwOBA | 28 K% | 15 BB%", post)
         self.assertNotIn("28% K%", post)
         self.assertLessEqual(len(post), 300)
 
@@ -52,12 +53,14 @@ class OptionHitterFormattingTests(unittest.TestCase):
             "MLB since Aug 1",
             selected,
             usage={"games": 6, "starts": 1},
+            woba=0.250,
             xwoba=0.500,
         )
         self.assertIn(
             "MLB since Aug 1: 6 G (1 GS), 8 PA, .000/.250/.000 (.250 OPS)",
             post,
         )
+        self.assertNotIn("wOBA", post)
         self.assertNotIn("xwOBA", post)
         self.assertNotIn("K%", post)
         self.assertNotIn("BB%", post)
@@ -70,13 +73,14 @@ class OptionHitterFormattingTests(unittest.TestCase):
             "MLB since Jul 10",
             self.selected,
             usage={"games": 23, "starts": 13},
+            woba=0.197954,
             xwoba=0.295618,
             max_len=300,
         )
         self.assertLessEqual(len(post), 300)
         # If everything cannot fit, expected/process context outranks G/GS.
         if "23 G (13 GS)" not in post:
-            self.assertIn(".296 xwOBA | 28 K% | 15 BB%", post)
+            self.assertIn(".198 wOBA / .296 xwOBA | 28 K% | 15 BB%", post)
 
 
 class StatcastContextTests(unittest.TestCase):
