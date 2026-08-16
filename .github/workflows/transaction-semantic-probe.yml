@@ -17,19 +17,21 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - name: Probe transaction catalog and real Giants usage
+      - name: Probe remaining transaction codes
         run: |
           python - <<'PY'
           from collections import Counter, defaultdict
           import bot_core as infra
 
           catalog = infra.request_json_with_retry("https://statsapi.mlb.com/api/v1/transactionTypes")
-          wanted = {"DES", "DFA", "CLW", "OUT", "RE", "REL", "CU", "SE", "SC", "OPT", "SFA", "FA"}
+          catalog_by_code = {
+              str(item.get("code") or item.get("typeCode") or "").upper(): item
+              for item in catalog
+          }
+          wanted = {"ACQ", "ASG", "NUM", "SGN", "TR", "DES", "DFA", "CLW", "OUT", "RE", "REL"}
           print("CATALOG")
-          for item in catalog:
-              code = str(item.get("code") or item.get("typeCode") or "").upper()
-              if code in wanted:
-                  print(code, item)
+          for code in sorted(wanted):
+              print(code, catalog_by_code.get(code))
 
           data = infra.request_json_with_retry(
               "https://statsapi.mlb.com/api/v1/transactions"
@@ -37,14 +39,12 @@ jobs:
           )
           txns = data.get("transactions") or []
           counts = Counter((tx.get("typeCode") or "").upper() for tx in txns)
-          print("\nCOUNTS")
-          for code, count in sorted(counts.items()):
-              print(code, count)
+          print("\nCOUNTS", dict(sorted(counts.items())))
 
           examples = defaultdict(list)
           for tx in txns:
               code = (tx.get("typeCode") or "").upper()
-              if code in wanted and len(examples[code]) < 8:
+              if code in wanted and len(examples[code]) < 12:
                   examples[code].append((tx.get("date"), tx.get("typeDesc"), tx.get("description")))
           print("\nEXAMPLES")
           for code in sorted(examples):
