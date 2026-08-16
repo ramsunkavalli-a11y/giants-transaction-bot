@@ -4,6 +4,7 @@ Runtime responsibilities are intentionally separated:
 - bot_core: polling/state/Bluesky plumbing and stable generic helpers
 - mlb_domain: verified StatsAPI transaction semantics and player data access
 - post_builder: transaction-specific enrichment and presentation
+- transaction_context: compact roster-mechanics context
 
 This entrypoint orchestrates those layers directly; it does not monkey-patch
 bot_core's legacy transaction/stat helpers.
@@ -11,6 +12,7 @@ bot_core's legacy transaction/stat helpers.
 
 import bot_core as infra
 import post_builder
+import transaction_context
 
 
 def record_successful_post(text, new_txns, seen_ids):
@@ -87,6 +89,13 @@ def main():
         player_cache=cache,
         season_mode=season_mode,
         now_la=now_la,
+    )
+    posts_to_send = transaction_context.enrich_posts(
+        posts_to_send,
+        new_txns,
+        cache=cache,
+        now_la=now_la,
+        max_len=infra.MAX_POST_LEN,
     )
 
     if not posts_to_send:
