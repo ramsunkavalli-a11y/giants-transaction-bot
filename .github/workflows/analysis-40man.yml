@@ -10,32 +10,56 @@ permissions:
 
 jobs:
   analyze:
-    if: github.event.head_commit.message == 'Compare current and dated Giants 40-man'
+    if: github.event.head_commit.message == 'Inspect same-day 40-man transaction timing'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - run: pip install requests
-      - name: Compare current vs dated roster
+      - name: Inspect same-day roster and transaction timing
         run: |
           python - <<'PY'
           import requests
-          BASE='https://statsapi.mlb.com/api/v1/teams/137/roster/40Man'
-          def pull(url):
-              r=requests.get(url,timeout=30); r.raise_for_status(); return r.json().get('roster') or []
-          def counted(roster):
-              out={}
-              for x in roster:
-                  p=x.get('person') or {}; s=x.get('status') or {}
-                  if s.get('code')!='D60': out[p.get('id')]=(p.get('fullName'),s.get('code'),s.get('description'))
-              return out
-          current=pull(BASE)
-          dated=pull(BASE+'?date=2026-08-16')
-          c=counted(current); d=counted(dated)
-          print('CURRENT_RAW',len(current),'CURRENT_COUNTED',len(c))
-          print('DATED_RAW',len(dated),'DATED_COUNTED',len(d))
-          print('CURRENT_NOT_DATED',[c[k] for k in sorted(set(c)-set(d))])
-          print('DATED_NOT_CURRENT',[d[k] for k in sorted(set(d)-set(c))])
-          print('CURRENT_D60',[(x.get('person',{}).get('fullName'),(x.get('status') or {}).get('description')) for x in current if (x.get('status') or {}).get('code')=='D60'])
+          from datetime import date, timedelta
+          from collections import Counter
+
+          BASE='https://statsapi.mlb.com/api/v1'
+          def get(url):
+              r=requests.get(url,timeout=30); r.raise_for_status(); return r.json()
+          def roster(tid,d=None):
+              url=f'{BASE}/teams/{tid}/roster/40Man'
+              if d: url += f'?date={d}'
+              return get(url).get('roster') or []
+          def counted(rs):
+              return [x for x in rs if (x.get('status') or {}).get('code')!='D60']
+          def txs(tid,d):
+              return get(f'{BASE}/transactions?teamId={tid}&startDate={d}&endDate={d}').get('transactions') or []
+          def show_team_day(tid,d,label):
+              rs=roster(tid,d)
+              print('\n===',label,d,'===')
+              print('RAW',len(rs),'COUNTED_NON_D60',len(counted(rs)))
+              print('STATUS',Counter((x.get('status') or {}).get('code') for x in rs))
+              for t in sorted(txs(tid,d), key=lambda x:x.get('id',0)):
+                  print('TX',t.get('id'),(t.get('typeCode') or ''),t.get('date'),t.get('description'))
+
+          # Giants around current day.
+          for d in ['2026-08-14','2026-08-15','2026-08-16']:
+              show_team_day(137,d,'GIANTS')
+          cur=roster(137)
+          print('\n=== GIANTS CURRENT ===')
+          print('RAW',len(cur),'COUNTED_NON_D60',len(counted(cur)))
+          print('STATUS',Counter((x.get('status') or {}).get('code') for x in cur))
+
+          # The 13 dates that appeared as 41 after excluding D60.
+          anomalies=[
+            (133,'2026-07-26','Athletics'),(134,'2026-08-01','Pittsburgh Pirates'),
+            (138,'2026-07-07','St. Louis Cardinals'),(139,'2026-05-29','Tampa Bay Rays'),
+            (139,'2026-05-30','Tampa Bay Rays'),(141,'2026-04-23','Toronto Blue Jays'),
+            (142,'2026-07-31','Minnesota Twins'),(144,'2026-04-02','Atlanta Braves'),
+            (147,'2026-07-17','New York Yankees'),(112,'2026-05-02','Chicago Cubs'),
+            (112,'2026-05-16','Chicago Cubs'),(117,'2026-07-06','Houston Astros'),
+            (120,'2026-06-11','Washington Nationals')]
+          for tid,d,label in anomalies:
+              show_team_day(tid,d,label)
           PY
