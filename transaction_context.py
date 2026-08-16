@@ -1,6 +1,6 @@
 """Compact roster-mechanics context for transaction posts.
 
-The existing post builder answers "how has the player performed?".  This layer
+The existing post builder answers "how has the player performed?". This layer
 adds one concise answer to "what does this move mean?" without changing the
 underlying transaction text, ordering, or stat enrichment.
 """
@@ -80,20 +80,28 @@ def _is_il_placement(tx: dict) -> bool:
     return "placed" in hay and " on the " in hay and "injured list" in hay
 
 
+def _is_mlb_il_placement(tx: dict) -> bool:
+    return _is_il_placement(tx) and roster.is_mlb_team_level_transaction(tx)
+
+
 def _is_il_reinstatement(tx: dict) -> bool:
     hay = f"{tx.get('typeDesc','')} {tx.get('description','')}".lower()
-    return domain.is_reinstated_transaction(tx) and "injured list" in hay
+    return (
+        domain.is_reinstated_transaction(tx)
+        and "injured list" in hay
+        and roster.is_mlb_team_level_transaction(tx)
+    )
 
 
 def _current_il_stint_start(history, current_tx):
-    """Return the start of the IL stint active immediately before current_tx."""
+    """Return the MLB IL stint active immediately before current_tx."""
     active_start = None
     ordered = sorted(
         [hist for hist in history if _before_current(hist, current_tx)],
         key=lambda item: (infra.txn_date_obj(item) or date.min, infra.txn_id(item)),
     )
     for hist in ordered:
-        if _is_il_placement(hist):
+        if _is_mlb_il_placement(hist):
             active_start = infra.txn_date_obj(hist)
         elif _is_il_reinstatement(hist):
             active_start = None
@@ -177,7 +185,11 @@ def _il_parts(history, current_tx):
         return []
     parts = []
     start = _current_il_stint_start(history, current_tx)
-    if roster.is_d60_create_transaction(current_tx) and start and start < tx_date:
+    if (
+        roster.is_mlb_team_d60_create_transaction(current_tx)
+        and start
+        and start < tx_date
+    ):
         parts.append(f"Out since {start.strftime('%b')} {start.day}")
     if _is_il_reinstatement(current_tx) and start:
         elapsed = (tx_date - start).days
@@ -218,13 +230,13 @@ def _acquisition_part(person_id: int, details: dict, tx: dict, cache) -> str | N
 
 def _forty_man_parts(tx: dict, cache) -> list[str]:
     action = None
-    if domain.is_dfa_transaction(tx) or roster.is_d60_create_transaction(tx):
+    if domain.is_dfa_transaction(tx) or roster.is_mlb_team_d60_create_transaction(tx):
         action = "Opens a 40-man spot"
     elif domain.is_contract_selected_transaction(tx):
         action = "Uses a 40-man spot"
     elif _is_incoming_claim(tx):
         action = "Uses a 40-man spot"
-    elif roster.is_d60_return_transaction(tx):
+    elif roster.is_mlb_team_d60_return_transaction(tx):
         action = "Uses a 40-man spot"
 
     if not action:
@@ -278,7 +290,7 @@ def context_parts_for_transaction(tx: dict, cache=None, now_la=None) -> list[str
 
     parts.extend(_il_parts(history, tx))
 
-    # Professional acquisitions get at most one player-identity nugget.  It is
+    # Professional acquisitions get at most one player-identity nugget. It is
     # deliberately ahead of the generic 40-man count in the fit priority.
     if _is_professional_acquisition(tx):
         details = details or domain.fetch_player_details(person_id, cache=cache)
@@ -298,7 +310,7 @@ def _insert_context(post: str, parts: list[str], max_len: int) -> str:
     if lines and lines[-1].startswith("https://www.mlb.com/player/"):
         insert_at = len(lines) - 1
 
-    # Drop lower-priority tail pieces until the context fits.  The first piece
+    # Drop lower-priority tail pieces until the context fits. The first piece
     # is always the transaction-specific insight; 40-man count is deliberately
     # easiest to drop.
     candidates = list(parts)
