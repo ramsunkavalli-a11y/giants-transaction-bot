@@ -34,19 +34,21 @@ jobs:
           start = roster.regular_season_start(137, 2026, cache=cache)
           print('REGULAR_SEASON_START', start)
 
-          m_history, m_ok = domain.fetch_player_transactions(
-              700280, date(2025, 1, 1), date(2026, 8, 3), cache=cache
-          )
-          print('MENDEZ_HISTORY_OK', m_ok)
-          for tx in m_history:
-              print('MENDEZ_TX', tx.get('id'), tx.get('date'), tx.get('typeCode'), tx.get('typeDesc'), tx.get('description'))
-          m_state, m_state_ok = roster.recent_player_40man_state(
-              700280, date(2026, 8, 3), cache=cache
-          )
-          print('MENDEZ_INFERRED_STATE', m_state, m_state_ok)
+          for label, pid in [('MENDEZ',700280),('LALANE',700649),('GAIR',700248)]:
+              history, ok = domain.fetch_player_transactions(
+                  pid, date(2022, 1, 1), date(2026, 8, 3), cache=cache
+              )
+              print('\n', label, 'HISTORY_OK', ok)
+              for tx in history:
+                  change = roster._generic_40man_state_change(tx)
+                  print(label+'_TX', tx.get('id'), tx.get('date'), tx.get('typeCode'), tx.get('typeDesc'), 'STATE_CHANGE=',change, tx.get('description'))
+              state, state_ok = roster.recent_player_40man_state(
+                  pid, date(2026, 8, 3), cache=cache
+              )
+              print(label+'_INFERRED_STATE', state, state_ok)
 
           base, base_ok = roster.fetch_40man_members(137, None, cache=cache)
-          print('CURRENT_BASE_NON_D60', len(base), 'OK', base_ok)
+          print('\nCURRENT_BASE_NON_D60', len(base), 'OK', base_ok)
           windows, windows_ok = roster.build_trade_exception_windows(137, start, today, cache=cache)
           print('TRADE_WINDOWS_OK', windows_ok)
           for w in windows:
@@ -55,49 +57,55 @@ jobs:
           current, additions, current_ok = roster_daily.current_adjusted_count(137, today, windows, cache)
           print('CURRENT_ADJUSTED', current, 'OK', current_ok, 'ADDITIONS', additions)
 
-          if current == 40 and {a.get('person_id') for a in additions} == {700280}:
-              counts, reconciliations, hist_ok = roster_daily.calculate_open_day_history(137, today, cache=cache)
-              print('HISTORY_OK', hist_ok, 'DAYS', len(counts))
-              summary = roster_daily.summarize_counts(counts, today)
-              print('TODAY_SUMMARY', summary)
-              print('AUG_COUNTS')
-              for d in sorted(counts):
-                  if d >= date(2026, 8, 1):
-                      print(d, counts[d], reconciliations.get(d))
-
-              data = infra.request_json_with_retry(
-                  'https://statsapi.mlb.com/api/v1/transactions?teamId=137&startDate=2026-08-10&endDate=2026-08-16'
-              )
-              txs = data.get('transactions') or []
-              targets = []
-              wanted = [
-                  ('McCray option', lambda t: t.get('typeCode') == 'OPT' and 'Grant McCray' in (t.get('description') or '')),
-                  ('Whitcomb claim', lambda t: t.get('typeCode') == 'CLW' and 'Shay Whitcomb' in (t.get('description') or '')),
-                  ('Chapman D60', lambda t: 'Matt Chapman' in (t.get('description') or '') and '60-day injured list' in (t.get('description') or '')),
-                  ('Hill selection', lambda t: t.get('typeCode') == 'SE' and 'Turner Hill' in (t.get('description') or '')),
-                  ('Leonard outright', lambda t: t.get('typeCode') == 'OUT' and 'Eddys Leonard' in (t.get('description') or '')),
-              ]
-              for label, pred in wanted:
-                  match = next((t for t in txs if pred(t)), None)
-                  print('TARGET', label, bool(match), (match or {}).get('id'))
-                  if match:
-                      targets.append(match)
-
-              for tx in targets:
-                  raw_posts = post_builder.build_posts(
-                      [tx], player_cache=cache, season_mode=True,
-                      now_la=datetime(2026, 8, 16, 15, 0),
-                  )
-                  posts = transaction_context.enrich_posts(
-                      raw_posts, [tx], cache=cache,
-                      now_la=datetime(2026, 8, 16, 15, 0),
-                  )
-                  print('\nTX', tx.get('id'), tx.get('typeCode'), tx.get('description'))
-                  for p in posts:
-                      print('LEN', len(p))
-                      print(p)
-
-          # Keep the validation red until the narrow current reconciliation is correct.
+          # Keep red until the narrow current reconciliation is correct.
           assert current == 40, (current, additions)
           assert {a.get('person_id') for a in additions} == {700280}, additions
+
+          counts, reconciliations, hist_ok = roster_daily.calculate_open_day_history(137, today, cache=cache)
+          print('HISTORY_OK', hist_ok, 'DAYS', len(counts))
+          summary = roster_daily.summarize_counts(counts, today)
+          print('TODAY_SUMMARY', summary)
+          print('AUG_COUNTS')
+          for d in sorted(counts):
+              if d >= date(2026, 8, 1):
+                  print(d, counts[d], reconciliations.get(d))
+          assert hist_ok
+          assert summary['count'] == 40
+          assert summary['open'] is False
+          assert counts[date(2026, 8, 9)] < 40
+          assert counts[date(2026, 8, 10)] == 40
+
+          data = infra.request_json_with_retry(
+              'https://statsapi.mlb.com/api/v1/transactions?teamId=137&startDate=2026-08-10&endDate=2026-08-16'
+          )
+          txs = data.get('transactions') or []
+          targets = []
+          wanted = [
+              ('McCray option', lambda t: t.get('typeCode') == 'OPT' and 'Grant McCray' in (t.get('description') or '')),
+              ('Whitcomb claim', lambda t: t.get('typeCode') == 'CLW' and 'Shay Whitcomb' in (t.get('description') or '')),
+              ('Chapman D60', lambda t: 'Matt Chapman' in (t.get('description') or '') and '60-day injured list' in (t.get('description') or '')),
+              ('Hill selection', lambda t: t.get('typeCode') == 'SE' and 'Turner Hill' in (t.get('description') or '')),
+              ('Leonard outright', lambda t: t.get('typeCode') == 'OUT' and 'Eddys Leonard' in (t.get('description') or '')),
+          ]
+          for label, pred in wanted:
+              match = next((t for t in txs if pred(t)), None)
+              print('TARGET', label, bool(match), (match or {}).get('id'))
+              if match:
+                  targets.append(match)
+
+          for tx in targets:
+              raw_posts = post_builder.build_posts(
+                  [tx], player_cache=cache, season_mode=True,
+                  now_la=datetime(2026, 8, 16, 15, 0),
+              )
+              posts = transaction_context.enrich_posts(
+                  raw_posts, [tx], cache=cache,
+                  now_la=datetime(2026, 8, 16, 15, 0),
+              )
+              print('\nTX', tx.get('id'), tx.get('typeCode'), tx.get('description'))
+              for p in posts:
+                  print('LEN', len(p))
+                  print(p)
+                  assert len(p) <= 300
+                  assert all(x not in p for x in ('41/40','42/40','43/40'))
           PY
