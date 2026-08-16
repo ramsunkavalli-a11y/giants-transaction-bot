@@ -661,6 +661,37 @@ def build_posts(new_txns, player_cache=None, season_mode=False, now_la=None):
     grouped = []
 
     for tx in sorted(new_txns, key=infra.txn_id):
+        # Jersey-number changes are administrative noise, including the mass
+        # Jackie Robinson Day switch to No. 42. Marking fetched IDs seen is
+        # handled by bot.py even when this builder intentionally emits nothing.
+        if domain.is_number_change_transaction(tx):
+            continue
+
+        # Incoming waiver claims benefit from the same date-bounded player
+        # context used for signings. Outgoing claims remain grouped/plain so a
+        # DFA followed by a claim does not repeat the same player evaluation.
+        if (
+            domain.is_claimed_off_waivers_transaction(tx)
+            and infra._safe_int(infra._get_in(tx, "toTeam", "id")) == infra.TEAM_ID
+        ):
+            base_text = infra.build_base_tx_text(tx)
+            person_id = infra.extract_tx_player_id(tx)
+            if not person_id:
+                separate_posts.append(base_text)
+                continue
+            details = domain.fetch_player_details(person_id, cache=cache)
+            tx_date = infra.txn_date_obj(tx) or now_la.date()
+            enrichment = build_signing_enrichment(details, tx_date, cache=cache)
+            separate_posts.append(
+                build_signing_post(
+                    base_text,
+                    infra.player_url(person_id),
+                    enrichment,
+                    max_len=infra.MAX_POST_LEN,
+                )
+            )
+            continue
+
         category = domain.classify_transaction(tx, season_mode=season_mode)
 
         if category == "signing":
