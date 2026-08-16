@@ -56,6 +56,27 @@ class RosterDailyTests(unittest.TestCase):
         fixed = roster_daily.normalize_isolated_transaction_dips(counts, txs, 137)
         self.assertEqual(fixed[date(2026, 7, 2)], 40)
 
+    def test_affiliate_d60_cannot_normalize_day(self):
+        counts = {
+            date(2026, 7, 1): 40,
+            date(2026, 7, 2): 39,
+            date(2026, 7, 3): 40,
+        }
+        txs = [
+            {
+                "id": 1, "date": "2026-07-02", "typeCode": "SC",
+                "description": "Sacramento River Cats transferred RHP A to the 60-day injured list.",
+                "person": {"id": 1},
+            },
+            {
+                "id": 2, "date": "2026-07-02", "typeCode": "SE",
+                "description": "San Francisco Giants selected the contract of RHP B.",
+                "person": {"id": 2},
+            },
+        ]
+        fixed = roster_daily.normalize_isolated_transaction_dips(counts, txs, 137)
+        self.assertEqual(fixed[date(2026, 7, 2)], 39)
+
     def test_real_open_dip_is_not_normalized_without_40man_add(self):
         counts = {
             date(2026, 7, 1): 40,
