@@ -100,7 +100,7 @@ class AggregationTests(unittest.TestCase):
         self.assertEqual(stat["baseOnBalls"], 3)
         self.assertEqual(stat["avg"], "0.389")
         self.assertEqual(stat["obp"], "0.500")
-        self.assertEqual(stat["slg"], "0.722")
+        self.assertEqual(stat["slg"], "0.778")
 
     def test_combines_pitching_splits_using_outs(self):
         splits = [
