@@ -1,0 +1,90 @@
+name: API exploration
+
+on:
+  push:
+    branches:
+      - agent/enrichment-formatting-v1
+
+permissions:
+  contents: read
+
+jobs:
+  explore:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Probe MLB StatsAPI stat types
+        run: |
+          python - <<'PY'
+          import json
+          import requests
+
+          BASE = "https://statsapi.mlb.com/api/v1"
+
+          def probe(label, player_id, **params):
+              url = f"{BASE}/people/{player_id}/stats"
+              r = requests.get(url, params=params, timeout=30)
+              print("\n" + "=" * 100)
+              print(label)
+              print(r.url)
+              print("status", r.status_code)
+              try:
+                  data = r.json()
+              except Exception:
+                  print(r.text[:2000])
+                  return
+              blocks = data.get("stats") or []
+              print("blocks", len(blocks))
+              for bi, block in enumerate(blocks[:3]):
+                  print(" block", bi, "type=", (block.get("type") or {}).get("displayName"),
+                        "group=", (block.get("group") or {}).get("displayName"),
+                        "splits=", len(block.get("splits") or []))
+                  for si, split in enumerate((block.get("splits") or [])[:3]):
+                      stat = split.get("stat") or {}
+                      print("  split", si,
+                            "season=", split.get("season"),
+                            "date=", split.get("date"),
+                            "gamePk=", (split.get("game") or {}).get("gamePk"),
+                            "team=", (split.get("team") or {}).get("name"),
+                            "sport=", (split.get("sport") or {}).get("id"))
+                      print("   keys", sorted(stat.keys()))
+                      print("   stat", json.dumps(stat, sort_keys=True)[:3500])
+
+          common_hit = dict(group="hitting", sportId=1, season=2026)
+          bounded_hit = dict(common_hit, startDate="2026-07-10", endDate="2026-08-14")
+          common_pitch = dict(group="pitching", sportId=1, season=2026)
+          bounded_pitch = dict(common_pitch, startDate="2026-08-07", endDate="2026-08-16")
+
+          # Grant McCray: hitter with a known July 10-Aug 14 MLB stint.
+          for stat_type in [
+              "expectedStatistics", "byDateRangeAdvanced", "gameLog", "tracking",
+              "sabermetrics", "outsAboveAverage", "projected_ZipsRos", "availableStats",
+          ]:
+              params = dict(bounded_hit)
+              params["stats"] = stat_type
+              probe(f"McCray {stat_type} BOUNDED", 687529, **params)
+
+          # Compare expected stats with/without date bounds to see whether the endpoint honors them.
+          params = dict(common_hit, stats="expectedStatistics")
+          probe("McCray expectedStatistics FULL SEASON", 687529, **params)
+
+          # Trent Harris: pitcher selected Aug 7; useful for pitcher-side API shape discovery.
+          for stat_type in [
+              "expectedStatistics", "byDateRangeAdvanced", "gameLog", "tracking",
+              "sabermetrics", "pitchArsenal", "metricAverages", "projected_ZipsRos", "availableStats",
+          ]:
+              params = dict(bounded_pitch)
+              params["stats"] = stat_type
+              probe(f"Harris {stat_type} BOUNDED", 805345, **params)
+
+          # Metadata endpoints that may reveal additional useful capabilities.
+          for path in ["statTypes", "metrics", "baseballStats"]:
+              r = requests.get(f"{BASE}/{path}", timeout=30)
+              print("\n" + "=" * 100)
+              print("METADATA", path, r.status_code, r.url)
+              print(r.text[:12000])
+          PY
