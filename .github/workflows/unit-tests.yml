@@ -18,6 +18,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Compile
-        run: python -m py_compile bot.py bot_core.py mlb_domain.py pitching_domain.py post_builder.py statcast_domain.py roster_intelligence.py transaction_context.py
+        run: python -m py_compile bot.py bot_core.py mlb_domain.py pitching_domain.py post_builder.py statcast_domain.py roster_intelligence.py transaction_context.py acquisition_intelligence.py
       - name: Run offline regression tests
         run: python -m unittest discover -s tests -p 'test_*.py' -v
