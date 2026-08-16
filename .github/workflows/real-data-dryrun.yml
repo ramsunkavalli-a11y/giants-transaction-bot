@@ -17,74 +17,80 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - name: Probe dedicated MLB stats endpoint
+      - name: Probe player-scoped stats and transaction endpoints
         run: |
           python - <<'PY'
           from urllib.parse import urlencode
           import bot_core as core
 
-          def stats_url(**params):
-              return "https://statsapi.mlb.com/api/v1/stats?" + urlencode(params)
+          def url(path, **params):
+              return "https://statsapi.mlb.com/api/v1" + path + ("?" + urlencode(params) if params else "")
 
-          def summarize(label, **params):
+          def summarize_stats(label, pid, **params):
               print("\n" + "=" * 80)
-              print(label)
-              print(params)
-              data = core.request_json_with_retry(stats_url(**params))
+              print(label, params)
+              data = core.request_json_with_retry(url(f"/people/{pid}/stats", **params))
               blocks = data.get("stats") or []
               print("blocks:", len(blocks))
               for block in blocks:
-                  print(" block type/group:", block.get("type"), block.get("group"), "splits", len(block.get("splits") or []))
-                  for split in (block.get("splits") or [])[:10]:
+                  print(" block", block.get("type"), block.get("group"), "splits", len(block.get("splits") or []))
+                  for split in block.get("splits") or []:
                       st = split.get("stat") or {}
                       print({
-                          "season": split.get("season"),
-                          "sport": split.get("sport"),
-                          "league": split.get("league"),
-                          "team": split.get("team"),
-                          "date": split.get("date"),
-                          "PA": st.get("plateAppearances"),
-                          "AVG": st.get("avg"),
-                          "OBP": st.get("obp"),
-                          "SLG": st.get("slg"),
-                          "HR": st.get("homeRuns"),
-                          "IP": st.get("inningsPitched"),
-                          "H": st.get("hits"),
-                          "ERA": st.get("era"),
-                          "K": st.get("strikeOuts"),
-                          "BB": st.get("baseOnBalls"),
+                          "season": split.get("season"), "sport": split.get("sport"),
+                          "league": split.get("league"), "team": split.get("team"),
+                          "PA": st.get("plateAppearances"), "AVG": st.get("avg"),
+                          "OBP": st.get("obp"), "SLG": st.get("slg"), "HR": st.get("homeRuns"),
+                          "IP": st.get("inningsPitched"), "H": st.get("hits"), "ERA": st.get("era"),
+                          "K": st.get("strikeOuts"), "BB": st.get("baseOnBalls"),
+                          "Kpct": st.get("strikeoutPercentage"), "BBpct": st.get("baseOnBallsPercentage"),
                       })
               return data
 
-          sports = core.request_json_with_retry("https://statsapi.mlb.com/api/v1/sports")
-          print("SPORT IDS")
-          for s in sports.get("sports") or []:
-              if any(x in (s.get("name") or "").lower() for x in ("major", "triple", "double", "high", "single", "rookie")):
-                  print(s.get("id"), s.get("name"), s.get("abbreviation"))
+          def summarize_tx(label, pid):
+              print("\n" + "=" * 80)
+              print(label)
+              data = core.request_json_with_retry(url(
+                  "/transactions", playerId=pid, startDate="2026-01-01", endDate="2026-08-14"
+              ))
+              txs = data.get("transactions") or []
+              print("transactions:", len(txs))
+              for t in txs[-15:]:
+                  print(t.get("id"), t.get("effectiveDate"), t.get("typeCode"), t.get("typeDesc"), t.get("description"))
+              return data
 
-          summarize(
-              "Grant McCray MLB since Jul 10",
-              stats="byDateRange", group="hitting", personId=687529,
-              sportIds=1, season=2026, startDate="2026-07-10", endDate="2026-08-14",
+          summarize_tx("Grant McCray transaction history", 687529)
+          summarize_stats(
+              "Grant McCray MLB since Jul 10", 687529,
+              stats="byDateRange", group="hitting", sportIds=1, season=2026,
+              startDate="2026-07-10", endDate="2026-08-14",
           )
-          summarize(
-              "Jonah Cox AAA since Aug 4",
-              stats="byDateRange", group="hitting", personId=813841,
-              sportIds=11, season=2026, startDate="2026-08-04", endDate="2026-08-14",
+          summarize_tx("Jonah Cox transaction history", 813841)
+          summarize_stats(
+              "Jonah Cox AAA since Aug 4", 813841,
+              stats="byDateRange", group="hitting", sportIds=11, season=2026,
+              startDate="2026-08-04", endDate="2026-08-14",
           )
-          summarize(
-              "Andrew Knizner 2026 AAA",
-              stats="season", group="hitting", personId=668800,
-              sportIds=11, season=2026,
+          summarize_tx("Nate Furman transaction history", 801501)
+          summarize_stats(
+              "Nate Furman MLB since Aug 1", 801501,
+              stats="byDateRange", group="hitting", sportIds=1, season=2026,
+              startDate="2026-08-01", endDate="2026-08-14",
           )
-          summarize(
-              "Trent Harris 2026 AAA",
-              stats="season", group="pitching", personId=805345,
-              sportIds=11, season=2026,
+          summarize_stats(
+              "Andrew Knizner 2026 AAA", 668800,
+              stats="season", group="hitting", sportIds=11, season=2026,
           )
-          summarize(
-              "Turner Hill 2026 AAA",
-              stats="season", group="hitting", personId=806367,
-              sportIds=11, season=2026,
+          summarize_stats(
+              "Andrew Knizner 2026 MLB", 668800,
+              stats="season", group="hitting", sportIds=1, season=2026,
+          )
+          summarize_stats(
+              "Trent Harris 2026 AAA", 805345,
+              stats="season", group="pitching", sportIds=11, season=2026,
+          )
+          summarize_stats(
+              "Turner Hill 2026 AAA", 806367,
+              stats="season", group="hitting", sportIds=11, season=2026,
           )
           PY
