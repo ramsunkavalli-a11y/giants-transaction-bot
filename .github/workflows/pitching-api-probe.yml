@@ -17,32 +17,49 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - name: Probe raw sabermetrics for real option stints
+      - name: Render real pitcher option transactions without Bluesky
         run: |
           python - <<'PY'
-          import json
-          from urllib.parse import urlencode
+          from datetime import datetime
           import bot_core as infra
+          import post_builder
 
-          cases = [
-              (676254, "Ryan Walker", "2026-06-12", "2026-07-09"),
-              (687931, "Carson Whisenhunt", "2026-07-09", "2026-07-10"),
-              (663941, "Tristan Beck", "2026-08-03", "2026-08-07"),
-          ]
-          for pid, name, start, end in cases:
-              params = urlencode({
-                  "stats": "sabermetrics",
-                  "group": "pitching",
-                  "sportId": 1,
-                  "season": 2026,
-                  "startDate": start,
-                  "endDate": end,
-              })
-              url = f"https://statsapi.mlb.com/api/v1/people/{pid}/stats?{params}"
-              data = infra.request_json_with_retry(url)
-              print("\n---", name, start, end)
-              for block in data.get("stats") or []:
-                  for split in block.get("splits") or []:
-                      print("team", (split.get("team") or {}).get("id"), (split.get("team") or {}).get("name"))
-                      print(json.dumps(split.get("stat") or {}, sort_keys=True))
+          data = infra.request_json_with_retry(
+              "https://statsapi.mlb.com/api/v1/transactions"
+              "?teamId=137&startDate=2026-06-01&endDate=2026-08-07"
+          )
+          txns = data.get("transactions") or []
+
+          def render(piece, day):
+              matches = [
+                  tx for tx in txns
+                  if piece.lower() in infra.txn_desc(tx).lower()
+                  and infra.txn_date(tx) == day
+              ]
+              assert matches, (piece, day)
+              posts = post_builder.build_posts(
+                  [sorted(matches, key=infra.txn_id)[0]],
+                  player_cache={}, season_mode=True,
+                  now_la=datetime(2026, 8, 16, 11, 0, 0),
+              )
+              assert len(posts) == 1, posts
+              post = posts[0]
+              print("\n" + "=" * 80 + "\n" + post)
+              assert len(post) <= infra.MAX_POST_LEN
+              return post
+
+          walker = render("optioned RHP Ryan Walker", "2026-07-09")
+          assert "MLB since Jun 12: 11 G, 11.0 IP, 9.00 ERA" in walker
+          assert "5.44 FIP / 5.13 xFIP | 10 K% | 10 BB%" in walker
+          assert "(0 GS)" not in walker
+
+          whisenhunt = render("optioned LHP Carson Whisenhunt", "2026-07-10")
+          assert "MLB since Jul 9: 1 G (1 GS), 5.2 IP, 3.18 ERA" in whisenhunt
+          assert "FIP" not in whisenhunt and "K%" not in whisenhunt and "BB%" not in whisenhunt
+
+          beck = render("optioned RHP Tristan Beck", "2026-08-07")
+          assert "MLB since Aug 3: 2 G, 1.1 IP, 13.50 ERA" in beck
+          assert "FIP" not in beck and "K%" not in beck and "BB%" not in beck
+
+          print("\nPITCHER OPTION LIVE DRY RUN PASSED")
           PY
