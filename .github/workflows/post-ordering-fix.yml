@@ -27,158 +27,69 @@ jobs:
 
           path = Path('post_builder.py')
           text = path.read_text()
-          start = text.index('def build_posts(new_txns, player_cache=None, season_mode=False, now_la=None):')
-          replacement = '''def build_posts(new_txns, player_cache=None, season_mode=False, now_la=None):
-    """Build posts in transaction-ID order while compacting adjacent plain moves."""
-    cache = player_cache if player_cache is not None else {}
-    now_la = now_la or infra._la_now()
-    posts = []
-    grouped_pending = []
-    seen_rehab_assignments = set()
 
-    def flush_grouped():
-        nonlocal grouped_pending
-        if not grouped_pending:
-            return
-        posts.extend(
-            infra.pack_posts(infra.build_date_group_blocks(grouped_pending))
-        )
-        grouped_pending = []
+          old = '    separate_posts = []\n    grouped = []\n    seen_rehab_assignments = set()\n\n    for tx in sorted(new_txns, key=infra.txn_id):\n'
+          new = '    posts = []\n    grouped_pending = []\n    seen_rehab_assignments = set()\n\n    def flush_grouped():\n        nonlocal grouped_pending\n        if not grouped_pending:\n            return\n        posts.extend(infra.pack_posts(infra.build_date_group_blocks(grouped_pending)))\n        grouped_pending = []\n\n    for tx in sorted(new_txns, key=infra.txn_id):\n'
+          if old not in text:
+              raise SystemExit('build_posts initialization not found')
+          text = text.replace(old, new, 1)
 
-    for tx in sorted(new_txns, key=infra.txn_id):
-        # Jersey-number changes are administrative noise, including the mass
-        # Jackie Robinson Day switch to No. 42. Marking fetched IDs seen is
-        # handled by bot.py even when this builder intentionally emits nothing.
-        if domain.is_number_change_transaction(tx):
-            continue
+          old = '        ):\n            base_text = infra.build_base_tx_text(tx)\n            person_id = infra.extract_tx_player_id(tx)\n'
+          new = '        ):\n            flush_grouped()\n            base_text = infra.build_base_tx_text(tx)\n            person_id = infra.extract_tx_player_id(tx)\n'
+          if old not in text:
+              raise SystemExit('incoming claim block not found')
+          text = text.replace(old, new, 1)
 
-        # ASG is overloaded by StatsAPI. Plain "assigned to San Francisco
-        # Giants" records are administrative roster-loading noise; rehab
-        # assignments are useful, but the API often emits exact duplicates.
-        if domain.is_generic_org_assignment_transaction(tx):
-            continue
-        if domain.is_rehab_assignment_transaction(tx):
-            rehab_key = (
-                infra.txn_date(tx),
-                infra.txn_desc(tx).strip().lower(),
-            )
-            if rehab_key in seen_rehab_assignments:
-                continue
-            seen_rehab_assignments.add(rehab_key)
+          text = text.replace('                separate_posts.append(base_text)\n', '                posts.append(base_text)\n')
+          text = text.replace('            separate_posts.append(\n                build_signing_post(', '            posts.append(\n                build_signing_post(')
 
-        # Incoming waiver claims benefit from the same date-bounded player
-        # context used for signings. Outgoing claims remain grouped/plain so a
-        # DFA followed by a claim does not repeat the same player evaluation.
-        if (
-            domain.is_claimed_off_waivers_transaction(tx)
-            and infra._safe_int(infra._get_in(tx, "toTeam", "id")) == infra.TEAM_ID
-        ):
-            flush_grouped()
-            base_text = infra.build_base_tx_text(tx)
-            person_id = infra.extract_tx_player_id(tx)
-            if not person_id:
-                posts.append(base_text)
-                continue
-            details = domain.fetch_player_details(person_id, cache=cache)
-            tx_date = infra.txn_date_obj(tx) or now_la.date()
-            enrichment = build_signing_enrichment(details, tx_date, cache=cache)
-            posts.append(
-                build_signing_post(
-                    base_text,
-                    infra.player_url(person_id),
-                    enrichment,
-                    max_len=infra.MAX_POST_LEN,
-                )
-            )
-            continue
+          old = '        if category == "signing":\n            base_text = infra.build_base_tx_text(tx)\n'
+          new = '        if category == "signing":\n            flush_grouped()\n            base_text = infra.build_base_tx_text(tx)\n'
+          if old not in text:
+              raise SystemExit('signing block not found')
+          text = text.replace(old, new, 1)
 
-        category = domain.classify_transaction(tx, season_mode=season_mode)
-
-        if category == "signing":
-            flush_grouped()
-            base_text = infra.build_base_tx_text(tx)
-            person_id = infra.extract_tx_player_id(tx)
-            if not person_id:
-                posts.append(base_text)
-                continue
-            details = domain.fetch_player_details(person_id, cache=cache)
-            tx_date = infra.txn_date_obj(tx) or now_la.date()
-            enrichment = build_signing_enrichment(details, tx_date, cache=cache)
-            posts.append(
-                build_signing_post(
-                    base_text,
-                    infra.player_url(person_id),
-                    enrichment,
-                    max_len=infra.MAX_POST_LEN,
-                )
-            )
-            continue
-
-        if category:
-            flush_grouped()
-            posts.append(
-                build_special_transaction_post(tx, category, cache, now_la)
-            )
-        else:
-            grouped_pending.append(tx)
-
-    flush_grouped()
-    return [post for post in posts if post and post.strip()]
-'''
-          path.write_text(text[:start] + replacement)
+          old = '        if category:\n            separate_posts.append(\n                build_special_transaction_post(tx, category, cache, now_la)\n            )\n        else:\n            grouped.append(tx)\n\n    grouped_posts = infra.pack_posts(infra.build_date_group_blocks(grouped))\n    return [\n        post for post in (grouped_posts + separate_posts)\n        if post and post.strip()\n    ]\n'
+          new = '        if category:\n            flush_grouped()\n            posts.append(\n                build_special_transaction_post(tx, category, cache, now_la)\n            )\n        else:\n            grouped_pending.append(tx)\n\n    flush_grouped()\n    return [post for post in posts if post and post.strip()]\n'
+          if old not in text:
+              raise SystemExit('build_posts tail not found')
+          text = text.replace(old, new, 1)
+          path.write_text(text)
 
           test_path = Path('tests/test_post_ordering.py')
-          test_path.write_text('''import unittest
-from datetime import datetime
-from unittest.mock import patch
-
-import post_builder
-
-
-class PostOrderingTests(unittest.TestCase):
-    def _tx(self, txid, code, description):
-        return {
-            "id": txid,
-            "date": "2026-08-14",
-            "typeCode": code,
-            "description": description,
-        }
-
-    def test_grouped_move_before_special_stays_before_special(self):
-        activation = self._tx(10, "SC", "San Francisco Giants activated C Test Player from the 10-day injured list.")
-        option = self._tx(11, "OPT", "San Francisco Giants optioned C Other Player to Sacramento River Cats.")
-        with patch.object(post_builder, "build_special_transaction_post", return_value="SPECIAL OPTION"):
-            posts = post_builder.build_posts(
-                [option, activation], season_mode=True, now_la=datetime(2026, 8, 14)
-            )
-        self.assertEqual(len(posts), 2)
-        self.assertIn("activated C Test Player", posts[0])
-        self.assertEqual(posts[1], "SPECIAL OPTION")
-
-    def test_special_before_grouped_move_stays_before_grouped(self):
-        option = self._tx(10, "OPT", "San Francisco Giants optioned C Other Player to Sacramento River Cats.")
-        activation = self._tx(11, "SC", "San Francisco Giants activated C Test Player from the 10-day injured list.")
-        with patch.object(post_builder, "build_special_transaction_post", return_value="SPECIAL OPTION"):
-            posts = post_builder.build_posts(
-                [activation, option], season_mode=True, now_la=datetime(2026, 8, 14)
-            )
-        self.assertEqual(len(posts), 2)
-        self.assertEqual(posts[0], "SPECIAL OPTION")
-        self.assertIn("activated C Test Player", posts[1])
-
-    def test_adjacent_plain_moves_still_pack_together(self):
-        first = self._tx(10, "SC", "San Francisco Giants activated C First Player.")
-        second = self._tx(11, "SC", "San Francisco Giants activated C Second Player.")
-        posts = post_builder.build_posts(
-            [second, first], season_mode=True, now_la=datetime(2026, 8, 14)
-        )
-        self.assertEqual(len(posts), 1)
-        self.assertLess(posts[0].index("First Player"), posts[0].index("Second Player"))
-
-
-if __name__ == "__main__":
-    unittest.main()
-''')
+          test_path.write_text(
+              'import unittest\n'
+              'from datetime import datetime\n'
+              'from unittest.mock import patch\n\n'
+              'import post_builder\n\n\n'
+              'class PostOrderingTests(unittest.TestCase):\n'
+              '    def _tx(self, txid, code, description):\n'
+              '        return {"id": txid, "date": "2026-08-14", "typeCode": code, "description": description}\n\n'
+              '    def test_grouped_move_before_special_stays_before_special(self):\n'
+              '        activation = self._tx(10, "SC", "San Francisco Giants activated C Test Player from the 10-day injured list.")\n'
+              '        option = self._tx(11, "OPT", "San Francisco Giants optioned C Other Player to Sacramento River Cats.")\n'
+              '        with patch.object(post_builder, "build_special_transaction_post", return_value="SPECIAL OPTION"):\n'
+              '            posts = post_builder.build_posts([option, activation], season_mode=True, now_la=datetime(2026, 8, 14))\n'
+              '        self.assertEqual(len(posts), 2)\n'
+              '        self.assertIn("activated C Test Player", posts[0])\n'
+              '        self.assertEqual(posts[1], "SPECIAL OPTION")\n\n'
+              '    def test_special_before_grouped_move_stays_before_grouped(self):\n'
+              '        option = self._tx(10, "OPT", "San Francisco Giants optioned C Other Player to Sacramento River Cats.")\n'
+              '        activation = self._tx(11, "SC", "San Francisco Giants activated C Test Player from the 10-day injured list.")\n'
+              '        with patch.object(post_builder, "build_special_transaction_post", return_value="SPECIAL OPTION"):\n'
+              '            posts = post_builder.build_posts([activation, option], season_mode=True, now_la=datetime(2026, 8, 14))\n'
+              '        self.assertEqual(len(posts), 2)\n'
+              '        self.assertEqual(posts[0], "SPECIAL OPTION")\n'
+              '        self.assertIn("activated C Test Player", posts[1])\n\n'
+              '    def test_adjacent_plain_moves_still_pack_together(self):\n'
+              '        first = self._tx(10, "SC", "San Francisco Giants activated C First Player.")\n'
+              '        second = self._tx(11, "SC", "San Francisco Giants activated C Second Player.")\n'
+              '        posts = post_builder.build_posts([second, first], season_mode=True, now_la=datetime(2026, 8, 14))\n'
+              '        self.assertEqual(len(posts), 1)\n'
+              '        self.assertLess(posts[0].index("First Player"), posts[0].index("Second Player"))\n\n'
+              'if __name__ == "__main__":\n'
+              '    unittest.main()\n'
+          )
           PY
       - name: Test and commit
         run: |
