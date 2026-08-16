@@ -1,11 +1,11 @@
 """40-man roster occupancy and reconciliation helpers.
 
 MLB's ``40Man`` roster endpoint includes players on the 60-day injured list,
-who do not occupy 40-man spots.  The helpers below exclude D60 players and add
+who do not occupy 40-man spots. The helpers below exclude D60 players and add
 a narrow reconciliation path for a known StatsAPI failure mode: a recently
-traded player who was on his previous club's 40-man can temporarily disappear
-from the acquiring club's 40-man feed while on a minor-league IL/rehab
-assignment.
+traded player whose direct transaction history proves he remained on the
+40-man can temporarily disappear from the acquiring club's roster feed while
+on a minor-league IL/rehab assignment.
 """
 
 from datetime import date, timedelta
@@ -152,7 +152,7 @@ def _generic_40man_state_change(tx: dict):
     if is_d60_create_transaction(tx):
         return False
 
-    # A clearly identified MLB contract creates a 40-man spot.  Generic/minor
+    # A clearly identified MLB contract creates a 40-man spot. Generic/minor
     # free-agent signings intentionally remain unknown.
     if domain.is_signing_transaction(tx):
         hay = f"{tx.get('typeDesc','')} {tx.get('description','')}".lower()
@@ -165,8 +165,9 @@ def recent_player_40man_state(person_id: int, before_date, cache=None,
                               lookback_days: int = 1825):
     """Infer 40-man state immediately before a date from transaction history.
 
-    This is independent confirmation for roster-feed reconciliation.  Trades,
-    options, recalls and minor-league assignments preserve the last known state.
+    Trades, options, recalls and minor-league assignments preserve the last
+    known state. This is deliberately conservative: no clear prior state means
+    no reconciliation.
     """
     cache = cache if cache is not None else {}
     before = _as_date(before_date)
@@ -191,13 +192,13 @@ def recent_player_40man_state(person_id: int, before_date, cache=None,
 
 
 def build_trade_exception_windows(team_id: int, start_date, end_date, cache=None):
-    """Find incoming trades with independently verified 40-man membership.
+    """Find incoming trades with transaction-history-proven 40-man membership.
 
-    StatsAPI's historical ``40Man`` feed can itself include false positives, so
-    appearance on the previous club's roster is not enough.  We require both:
-    (1) the player appears on that prior-club snapshot, and (2) direct player
-    transaction history says his last known 40-man state was ON.  Once verified,
-    the state carries through the trade until a later explicit removal.
+    MLB's historical ``40Man`` endpoint is not used as proof because it can
+    both omit true 40-man players and include non-counting minor leaguers. A
+    player receives an exception window only when his own transaction history
+    clearly establishes an ON state before the trade and no later transaction
+    removes him. No player names are hard-coded.
     """
     cache = cache if cache is not None else {}
     start = _as_date(start_date)
@@ -229,18 +230,10 @@ def build_trade_exception_windows(team_id: int, start_date, end_date, cache=None
 
     windows = []
     for (pid, trade_date), (tx, from_id) in incoming.items():
-        previous_members, prior_ok = fetch_40man_members(
-            from_id, trade_date - timedelta(days=1), cache=cache
-        )
         inferred, infer_ok = recent_player_40man_state(
             pid, trade_date, cache=cache
         )
-        if not (
-            prior_ok
-            and pid in previous_members
-            and infer_ok
-            and inferred is True
-        ):
+        if not (infer_ok and inferred is True):
             continue
 
         player_txs, hist_ok = domain.fetch_player_transactions(
@@ -265,8 +258,7 @@ def build_trade_exception_windows(team_id: int, start_date, end_date, cache=None
                 break
 
         name = (
-            previous_members.get(pid)
-            or infra._clean_text(infra._get_in(tx, "person", "fullName"))
+            infra._clean_text(infra._get_in(tx, "person", "fullName"))
             or str(pid)
         )
         windows.append({
@@ -329,7 +321,7 @@ def adjusted_40man_count(team_id: int, as_of_date=None, cache=None,
         trade_windows=trade_windows,
         lookback_days=lookback_days,
     )
-    # >40 historical snapshots are a StatsAPI sequencing artifact.  They are
+    # >40 historical snapshots are a StatsAPI sequencing artifact. They are
     # useful for diagnostics but can never be a valid published roster count.
     return (min(40, len(members)) if ok else None), additions, ok
 
