@@ -299,6 +299,15 @@ def extract_trade_incoming_players(tx: dict):
         incoming.append({"id": person_id, "name": player_name})
 
     candidates = []
+    # Real StatsAPI trade feeds emit one top-level transaction row per player
+    # leg, with person/fromTeam/toTeam on the row itself. Older/nested shapes
+    # are still supported below.
+    if (
+        isinstance(tx.get("person"), dict)
+        or isinstance(tx.get("toTeam"), dict)
+        or isinstance(tx.get("fromTeam"), dict)
+    ):
+        candidates.append(tx)
     if isinstance(tx.get("players"), list):
         candidates.extend(tx["players"])
     if isinstance(tx.get("playerTransactions"), list):
@@ -339,6 +348,52 @@ def extract_trade_incoming_players(tx: dict):
         seen.add(player["id"])
         unique.append(player)
     return unique
+
+
+def collapse_trade_records(txns):
+    """Collapse StatsAPI's one-row-per-leg trade shape into one transaction.
+
+    Real trade records share a transaction ID and description but repeat once
+    for each player/cash leg. Merging their structured legs preserves incoming
+    player links while preventing duplicate trade lines.
+    """
+    collapsed = []
+    trade_groups = {}
+
+    for tx in sorted(txns, key=txn_id):
+        if not is_trade(tx):
+            collapsed.append(tx)
+            continue
+
+        trade_id = txn_id(tx)
+        key = ("id", trade_id) if trade_id > 0 else (
+            "fallback", txn_date(tx), txn_desc(tx).strip().lower()
+        )
+        merged = trade_groups.get(key)
+        if merged is None:
+            merged = dict(tx)
+            merged["playerTransactions"] = []
+            trade_groups[key] = merged
+            collapsed.append(merged)
+
+        legs = merged["playerTransactions"]
+        if (
+            isinstance(tx.get("person"), dict)
+            or isinstance(tx.get("toTeam"), dict)
+            or isinstance(tx.get("fromTeam"), dict)
+        ):
+            legs.append({
+                "person": tx.get("person"),
+                "fromTeam": tx.get("fromTeam"),
+                "toTeam": tx.get("toTeam"),
+            })
+
+        for field in ("players", "playerTransactions", "playerTransaction"):
+            nested = tx.get(field)
+            if isinstance(nested, list):
+                legs.extend(item for item in nested if isinstance(item, dict))
+
+    return collapsed
 
 
 # -----------------------------
@@ -423,7 +478,7 @@ def pack_posts(blocks, max_len=MAX_POST_LEN):
 
 
 def build_date_group_blocks(txns):
-    txns = sorted(txns, key=txn_id)
+    txns = collapse_trade_records(txns)
     blocks = []
     current_date = None
     current_lines = []
