@@ -15,6 +15,7 @@ import bot_core as infra
 import mlb_domain as domain
 
 D60_CODE = "D60"
+GIANTS_NAME = "San Francisco Giants"
 
 
 def _as_date(value):
@@ -108,6 +109,36 @@ def is_d60_return_transaction(tx: dict) -> bool:
     )
 
 
+def is_mlb_team_level_transaction(tx: dict, team_id: int = infra.TEAM_ID,
+                                  team_name: str = GIANTS_NAME) -> bool:
+    """Identify a transaction executed by the MLB club, not an affiliate.
+
+    StatsAPI team transaction feeds also contain affiliate status changes. For
+    Giants-specific runtime use, an MLB-team ID on the transaction or an
+    official description beginning with "San Francisco Giants" is sufficient.
+    """
+    tid = int(team_id)
+    for field in ("team", "fromTeam", "toTeam"):
+        if infra._safe_int(infra._get_in(tx, field, "id")) == tid:
+            return True
+    description = infra._clean_text(tx.get("description")) or ""
+    return description.lower().startswith((team_name or "").strip().lower())
+
+
+def is_mlb_team_d60_create_transaction(tx: dict, team_id: int = infra.TEAM_ID,
+                                        team_name: str = GIANTS_NAME) -> bool:
+    return is_d60_create_transaction(tx) and is_mlb_team_level_transaction(
+        tx, team_id=team_id, team_name=team_name
+    )
+
+
+def is_mlb_team_d60_return_transaction(tx: dict, team_id: int = infra.TEAM_ID,
+                                        team_name: str = GIANTS_NAME) -> bool:
+    return is_d60_return_transaction(tx) and is_mlb_team_level_transaction(
+        tx, team_id=team_id, team_name=team_name
+    )
+
+
 def _is_removal_from_40man(tx: dict, team_id: int, person_id: int) -> bool:
     if infra.extract_tx_player_id(tx) != person_id:
         return False
@@ -119,7 +150,7 @@ def _is_removal_from_40man(tx: dict, team_id: int, person_id: int) -> bool:
         return True
     if domain.is_declared_free_agency_transaction(tx):
         return True
-    if is_d60_create_transaction(tx):
+    if is_mlb_team_d60_create_transaction(tx, team_id=team_id):
         return True
 
     code = (tx.get("typeCode") or "").strip().upper()
@@ -137,8 +168,6 @@ def _is_clear_40man_entry(tx: dict) -> bool:
     if domain.is_contract_selected_transaction(tx):
         return True
     if domain.is_claimed_off_waivers_transaction(tx):
-        # MLB's CLW stream is a 40-man waiver claim.  Minor-league assignments
-        # use different transaction types.
         return True
     if domain.is_signing_transaction(tx):
         hay = f"{tx.get('typeDesc','')} {tx.get('description','')}".lower()
@@ -156,20 +185,16 @@ def _is_clear_40man_exit(tx: dict) -> bool:
 
 
 def _generic_40man_state_change(tx: dict, has_40man_anchor: bool = False):
-    """Return state change, guarding against minor-league 60-day IL wording.
+    """Return only independently reliable 40-man state changes.
 
-    Minor-league clubs also use "60-day injured list" transactions.  Therefore
-    a D60 placement/activation is meaningful for 40-man inference only after a
-    player's history has independently established real 40-man membership.
+    D60 text is intentionally not interpreted here: affiliates also use a
+    60-day injured list. A D60 event after a known 40-man entry makes inferred
+    state uncertain unless a later clear entry re-establishes it.
     """
     if _is_clear_40man_entry(tx):
         return True
     if _is_clear_40man_exit(tx):
         return False
-    if has_40man_anchor and is_d60_create_transaction(tx):
-        return False
-    if has_40man_anchor and is_d60_return_transaction(tx):
-        return True
     return None
 
 
@@ -177,10 +202,11 @@ def recent_player_40man_state(person_id: int, before_date, cache=None,
                               lookback_days: int = 1825):
     """Infer 40-man state immediately before a date from transaction history.
 
-    Trades, options, recalls and minor-league assignments preserve the last
-    known state. 60-day IL events only affect state after a genuine 40-man
-    entry has been observed, preventing minor-league IL transactions from
-    creating false 40-man membership.
+    Trades, options, recalls and ordinary minor-league assignments preserve the
+    last known state. Any 60-day IL event after a genuine 40-man anchor makes
+    the inference unknown because MLB and minor-league D60 wording overlaps.
+    This is intentionally conservative: uncertain players are not used to
+    repair roster-feed omissions.
     """
     cache = cache if cache is not None else {}
     before = _as_date(before_date)
@@ -201,9 +227,15 @@ def recent_player_40man_state(person_id: int, before_date, cache=None,
     ):
         if _is_clear_40man_entry(hist):
             has_anchor = True
-        change = _generic_40man_state_change(hist, has_40man_anchor=has_anchor)
-        if change is not None:
-            state = change
+            state = True
+            continue
+        if _is_clear_40man_exit(hist):
+            state = False
+            continue
+        if has_anchor and (
+            is_d60_create_transaction(hist) or is_d60_return_transaction(hist)
+        ):
+            state = None
     return state, True
 
 
