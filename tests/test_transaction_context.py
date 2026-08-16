@@ -87,6 +87,21 @@ class TransactionContextTests(unittest.TestCase):
             ["Out since Jun 11", "Opens a 40-man spot", "40-man: 39/40"],
         )
 
+    def test_affiliate_60day_transfer_gets_no_40man_context(self):
+        placed = {
+            "id": 71, "date": "2026-06-11", "typeCode": "SC",
+            "description": "Sacramento River Cats placed RHP Test Player on the 7-day injured list.",
+            "person": {"id": 123},
+        }
+        current = {
+            "id": 72, "date": "2026-07-01", "typeCode": "SC",
+            "description": "Sacramento River Cats transferred RHP Test Player to the 60-day injured list.",
+            "person": {"id": 123},
+        }
+        with patch.object(context.domain, "fetch_player_transactions", return_value=([placed, current], True)):
+            parts = context.context_parts_for_transaction(current, cache={})
+        self.assertEqual(parts, [])
+
     def test_reinstatement_reports_il_duration(self):
         placed = {
             "id": 80, "date": "2026-06-01", "typeCode": "SC",
