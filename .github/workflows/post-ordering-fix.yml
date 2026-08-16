@@ -1,0 +1,192 @@
+name: Transaction post ordering fix
+
+on:
+  push:
+    branches:
+      - agent/enrichment-formatting-v1
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.head_commit.message == 'Apply transaction post ordering fix'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Apply ordering fix
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('post_builder.py')
+          text = path.read_text()
+          start = text.index('def build_posts(new_txns, player_cache=None, season_mode=False, now_la=None):')
+          replacement = '''def build_posts(new_txns, player_cache=None, season_mode=False, now_la=None):
+    """Build posts in transaction-ID order while compacting adjacent plain moves."""
+    cache = player_cache if player_cache is not None else {}
+    now_la = now_la or infra._la_now()
+    posts = []
+    grouped_pending = []
+    seen_rehab_assignments = set()
+
+    def flush_grouped():
+        nonlocal grouped_pending
+        if not grouped_pending:
+            return
+        posts.extend(
+            infra.pack_posts(infra.build_date_group_blocks(grouped_pending))
+        )
+        grouped_pending = []
+
+    for tx in sorted(new_txns, key=infra.txn_id):
+        # Jersey-number changes are administrative noise, including the mass
+        # Jackie Robinson Day switch to No. 42. Marking fetched IDs seen is
+        # handled by bot.py even when this builder intentionally emits nothing.
+        if domain.is_number_change_transaction(tx):
+            continue
+
+        # ASG is overloaded by StatsAPI. Plain "assigned to San Francisco
+        # Giants" records are administrative roster-loading noise; rehab
+        # assignments are useful, but the API often emits exact duplicates.
+        if domain.is_generic_org_assignment_transaction(tx):
+            continue
+        if domain.is_rehab_assignment_transaction(tx):
+            rehab_key = (
+                infra.txn_date(tx),
+                infra.txn_desc(tx).strip().lower(),
+            )
+            if rehab_key in seen_rehab_assignments:
+                continue
+            seen_rehab_assignments.add(rehab_key)
+
+        # Incoming waiver claims benefit from the same date-bounded player
+        # context used for signings. Outgoing claims remain grouped/plain so a
+        # DFA followed by a claim does not repeat the same player evaluation.
+        if (
+            domain.is_claimed_off_waivers_transaction(tx)
+            and infra._safe_int(infra._get_in(tx, "toTeam", "id")) == infra.TEAM_ID
+        ):
+            flush_grouped()
+            base_text = infra.build_base_tx_text(tx)
+            person_id = infra.extract_tx_player_id(tx)
+            if not person_id:
+                posts.append(base_text)
+                continue
+            details = domain.fetch_player_details(person_id, cache=cache)
+            tx_date = infra.txn_date_obj(tx) or now_la.date()
+            enrichment = build_signing_enrichment(details, tx_date, cache=cache)
+            posts.append(
+                build_signing_post(
+                    base_text,
+                    infra.player_url(person_id),
+                    enrichment,
+                    max_len=infra.MAX_POST_LEN,
+                )
+            )
+            continue
+
+        category = domain.classify_transaction(tx, season_mode=season_mode)
+
+        if category == "signing":
+            flush_grouped()
+            base_text = infra.build_base_tx_text(tx)
+            person_id = infra.extract_tx_player_id(tx)
+            if not person_id:
+                posts.append(base_text)
+                continue
+            details = domain.fetch_player_details(person_id, cache=cache)
+            tx_date = infra.txn_date_obj(tx) or now_la.date()
+            enrichment = build_signing_enrichment(details, tx_date, cache=cache)
+            posts.append(
+                build_signing_post(
+                    base_text,
+                    infra.player_url(person_id),
+                    enrichment,
+                    max_len=infra.MAX_POST_LEN,
+                )
+            )
+            continue
+
+        if category:
+            flush_grouped()
+            posts.append(
+                build_special_transaction_post(tx, category, cache, now_la)
+            )
+        else:
+            grouped_pending.append(tx)
+
+    flush_grouped()
+    return [post for post in posts if post and post.strip()]
+'''
+          path.write_text(text[:start] + replacement)
+
+          test_path = Path('tests/test_post_ordering.py')
+          test_path.write_text('''import unittest
+from datetime import datetime
+from unittest.mock import patch
+
+import post_builder
+
+
+class PostOrderingTests(unittest.TestCase):
+    def _tx(self, txid, code, description):
+        return {
+            "id": txid,
+            "date": "2026-08-14",
+            "typeCode": code,
+            "description": description,
+        }
+
+    def test_grouped_move_before_special_stays_before_special(self):
+        activation = self._tx(10, "SC", "San Francisco Giants activated C Test Player from the 10-day injured list.")
+        option = self._tx(11, "OPT", "San Francisco Giants optioned C Other Player to Sacramento River Cats.")
+        with patch.object(post_builder, "build_special_transaction_post", return_value="SPECIAL OPTION"):
+            posts = post_builder.build_posts(
+                [option, activation], season_mode=True, now_la=datetime(2026, 8, 14)
+            )
+        self.assertEqual(len(posts), 2)
+        self.assertIn("activated C Test Player", posts[0])
+        self.assertEqual(posts[1], "SPECIAL OPTION")
+
+    def test_special_before_grouped_move_stays_before_grouped(self):
+        option = self._tx(10, "OPT", "San Francisco Giants optioned C Other Player to Sacramento River Cats.")
+        activation = self._tx(11, "SC", "San Francisco Giants activated C Test Player from the 10-day injured list.")
+        with patch.object(post_builder, "build_special_transaction_post", return_value="SPECIAL OPTION"):
+            posts = post_builder.build_posts(
+                [activation, option], season_mode=True, now_la=datetime(2026, 8, 14)
+            )
+        self.assertEqual(len(posts), 2)
+        self.assertEqual(posts[0], "SPECIAL OPTION")
+        self.assertIn("activated C Test Player", posts[1])
+
+    def test_adjacent_plain_moves_still_pack_together(self):
+        first = self._tx(10, "SC", "San Francisco Giants activated C First Player.")
+        second = self._tx(11, "SC", "San Francisco Giants activated C Second Player.")
+        posts = post_builder.build_posts(
+            [second, first], season_mode=True, now_la=datetime(2026, 8, 14)
+        )
+        self.assertEqual(len(posts), 1)
+        self.assertLess(posts[0].index("First Player"), posts[0].index("Second Player"))
+
+
+if __name__ == "__main__":
+    unittest.main()
+''')
+          PY
+      - name: Test and commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add post_builder.py tests/test_post_ordering.py
+          git diff --cached --check
+          python -m py_compile post_builder.py tests/test_post_ordering.py
+          python -m unittest tests.test_post_ordering -v
+          git commit -m "Preserve transaction order across post types"
+          git push origin HEAD:agent/enrichment-formatting-v1
