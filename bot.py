@@ -1,14 +1,28 @@
 """Presentation/enrichment overrides for the Giants transaction bot.
 
 The proven transaction polling, dedupe, state, and Bluesky plumbing lives in
-bot_core.py unchanged. This module only replaces transaction classification and
-post-enrichment/formatting behavior, then delegates execution to bot_core.main().
+bot_core.py unchanged. This module replaces only transaction classification and
+enrichment/formatting behavior, then delegates execution to bot_core.main().
 """
+
+from datetime import datetime
+from urllib.parse import urlencode
 
 import bot_core as core
 
 SIGNING_MLB_MIN_PA = 30
 SIGNING_MLB_MIN_IP = 10.0
+SPORT_LEVELS = [(11, "AAA"), (12, "AA"), (13, "A+"), (14, "A"), (16, "Rk")]
+SPORT_LEVEL_BY_ID = {1: "MLB", **dict(SPORT_LEVELS)}
+
+
+def is_contract_selected_transaction(tx: dict) -> bool:
+    """StatsAPI currently reports contract selections as typeCode SE / Selected."""
+    tc = (tx.get("typeCode") or "").strip().upper()
+    hay = f"{tx.get('typeDesc','')} {tx.get('description','')}".lower()
+    return "selected the contract" in hay or "contract selected" in hay or (
+        tc == "SE" and "selected" in hay and "contract" in hay
+    )
 
 
 def is_signing_transaction(tx: dict) -> bool:
@@ -17,71 +31,26 @@ def is_signing_transaction(tx: dict) -> bool:
     desc = (tx.get("description") or "").strip().lower()
     hay = f"{td} {desc}"
 
-    negative = ("assigned", "designated", "released", "traded", "waiver", "optioned", "outright")
+    if is_contract_selected_transaction(tx):
+        return False
+
+    negative = (
+        "assigned", "designated", "released", "traded", "waiver",
+        "optioned", "outright", "activated", "recalled",
+    )
     if any(w in hay for w in negative):
         return False
 
-    # Contract selections are roster moves, not new signings. The old bot
-    # classified SC as a signing, which is why these sometimes received bio text.
-    if tc in {"SC", "CS"} or "contract selected" in hay:
-        return False
-
+    # SC is a generic StatsAPI "Status Change" code (IL moves, roster status,
+    # etc.), not a signing code. SE is "Selected" and is handled above.
     if tc in {"SFA", "SMC", "S", "FA"}:
         return True
 
-    positive = ("signed", "minor league contract", "major league contract", "free agent signing")
+    positive = (
+        "signed", "minor league contract", "major league contract",
+        "free agent signing",
+    )
     return any(w in hay for w in positive)
-
-
-def _selected_split_payload(split: dict):
-    return {
-        "seasonYear": core._safe_int(split.get("season")),
-        "orgName": core._clean_text(
-            core._get_in(split, "team", "name") or core._get_in(split, "organization", "name")
-        ),
-        "levelToken": core.level_token_from_split(split),
-        "splitStats": split.get("stat") or {},
-        "split": split,
-    }
-
-
-def select_filtered_level(stats_blocks, pitcher: bool, *, target_level=None, exclude_mlb=False, season=None):
-    target_group = "pitching" if pitcher else "hitting"
-    candidates = []
-    for split in core._extract_group_splits(stats_blocks, target_group):
-        if not core.has_appearances(split, pitcher):
-            continue
-        split_season = core._safe_int(split.get("season"))
-        if season is not None and split_season != int(season):
-            continue
-        token = core.level_token_from_split(split)
-        if not token:
-            continue
-        if target_level is not None and token != target_level:
-            continue
-        if exclude_mlb and token == "MLB":
-            continue
-        token_rank = core.LEVEL_RANK.get(token, 0)
-        vol = core._appearance_volume(split, pitcher)
-        team_name = core._clean_text(
-            core._get_in(split, "team", "name") or core._get_in(split, "organization", "name")
-        ) or ""
-        team_id = core._safe_int(
-            core._get_in(split, "team", "id") or core._get_in(split, "organization", "id")
-        ) or 0
-        candidates.append((split_season or 0, token_rank, vol, team_id, team_name, split))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]), reverse=True)
-    return _selected_split_payload(candidates[0][5])
-
-
-def select_mlb_appeared(stats_blocks, pitcher: bool, season=None):
-    return select_filtered_level(stats_blocks, pitcher, target_level="MLB", season=season)
-
-
-def select_highest_milb_appeared(stats_blocks, pitcher: bool, season=None):
-    return select_filtered_level(stats_blocks, pitcher, exclude_mlb=True, season=season)
 
 
 def _format_pct(v):
@@ -138,8 +107,18 @@ def format_stat_clause(stat: dict, pitcher: bool):
     obp = _format_slash_value(stat.get("obp"))
     slg = _format_slash_value(stat.get("slg"))
     hr = core._safe_int(stat.get("homeRuns"))
+    so = core._safe_int(stat.get("strikeOuts"))
+    bb = core._safe_int(stat.get("baseOnBalls"))
+
     k_pct = _format_pct(stat.get("strikeoutPercentage"))
     bb_pct = _format_pct(stat.get("baseOnBallsPercentage"))
+    # The player-scoped StatsAPI endpoint does not consistently populate the
+    # percentage fields, but it does return PA/K/BB. Compute standard K%/BB%.
+    if k_pct is None and pa and so is not None:
+        k_pct = f"{int(round(100 * so / pa))}%"
+    if bb_pct is None and pa and bb is not None:
+        bb_pct = f"{int(round(100 * bb / pa))}%"
+
     if pa is not None:
         parts.append(f"{pa} PA")
     if avg and obp and slg:
@@ -158,10 +137,168 @@ def shorten_stat_clause(stat_clause: str, pitcher: bool):
         return None
     parts = [p.strip() for p in stat_clause.split(",") if p.strip()]
     if pitcher:
+        # Keep IP / ERA / K first when character pressure requires trimming.
         parts = [p for p in parts if not p.endswith(" H") and not p.endswith(" BB")]
     else:
         parts = [p for p in parts if not (p.endswith("% K") or p.endswith("% BB"))]
     return ", ".join(parts).strip() or None
+
+
+def _stats_group(pitcher: bool):
+    return "pitching" if pitcher else "hitting"
+
+
+def _appearance_volume(stat: dict, pitcher: bool):
+    if pitcher:
+        return core._safe_float((stat or {}).get("inningsPitched")) or 0.0
+    return float(
+        core._safe_int((stat or {}).get("plateAppearances"))
+        or core._safe_int((stat or {}).get("atBats"))
+        or core._safe_int((stat or {}).get("gamesPlayed"))
+        or 0
+    )
+
+
+def _direct_stats_url(person_id: int, pitcher: bool, sport_id: int, stat_type: str,
+                      season: int, start_date=None, end_date=None):
+    params = {
+        "stats": stat_type,
+        "group": _stats_group(pitcher),
+        "sportId": sport_id,
+        "season": season,
+    }
+    if start_date:
+        params["startDate"] = str(start_date)
+    if end_date:
+        params["endDate"] = str(end_date)
+    return (
+        f"https://statsapi.mlb.com/api/v1/people/{person_id}/stats?"
+        + urlencode(params)
+    )
+
+
+def fetch_player_stat(person_id: int, pitcher: bool, sport_id: int, stat_type: str,
+                      season: int, cache=None, start_date=None, end_date=None):
+    """Fetch one player's stats from an exact MLB/MiLB sport level.
+
+    Returns (selected_split_payload, request_succeeded). For season stats, an
+    aggregate team=None split is preferred when a player appeared for multiple
+    clubs at the same level.
+    """
+    cache = cache if cache is not None else {}
+    key = (
+        "_direct_stats", person_id, pitcher, sport_id, stat_type, int(season),
+        str(start_date or ""), str(end_date or ""),
+    )
+    if key in cache:
+        return cache[key]
+
+    try:
+        data = core.request_json_with_retry(
+            _direct_stats_url(
+                person_id, pitcher, sport_id, stat_type, season,
+                start_date=start_date, end_date=end_date,
+            )
+        )
+    except Exception:
+        result = (None, False)
+        cache[key] = result
+        return result
+
+    candidates = []
+    for block in data.get("stats") or []:
+        for split in block.get("splits") or []:
+            if not isinstance(split, dict):
+                continue
+            if core._safe_int(core._get_in(split, "sport", "id")) != sport_id:
+                continue
+            stat = split.get("stat") or {}
+            if _appearance_volume(stat, pitcher) <= 0:
+                continue
+            team = split.get("team")
+            aggregate_rank = 1 if not team else 0
+            vol = _appearance_volume(stat, pitcher)
+            candidates.append((aggregate_rank, vol, split))
+
+    if not candidates:
+        result = (None, True)
+        cache[key] = result
+        return result
+
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    split = candidates[0][2]
+    selected = {
+        "seasonYear": core._safe_int(split.get("season")) or int(season),
+        "orgName": core._clean_text(core._get_in(split, "team", "name")),
+        "levelToken": SPORT_LEVEL_BY_ID.get(sport_id),
+        "splitStats": split.get("stat") or {},
+        "split": split,
+    }
+    result = (selected, True)
+    cache[key] = result
+    return result
+
+
+def fetch_highest_milb_stat(person_id: int, pitcher: bool, stat_type: str,
+                            season: int, cache=None, start_date=None, end_date=None):
+    any_success = False
+    for sport_id, _level in SPORT_LEVELS:
+        selected, ok = fetch_player_stat(
+            person_id, pitcher, sport_id, stat_type, season,
+            cache=cache, start_date=start_date, end_date=end_date,
+        )
+        any_success = any_success or ok
+        if selected:
+            return selected, True
+    return None, any_success
+
+
+def _transactions_url(person_id: int, start_date, end_date):
+    params = {
+        "playerId": person_id,
+        "startDate": str(start_date),
+        "endDate": str(end_date),
+    }
+    return "https://statsapi.mlb.com/api/v1/transactions?" + urlencode(params)
+
+
+def fetch_player_transactions(person_id: int, season_year: int, end_date, cache=None):
+    cache = cache if cache is not None else {}
+    start_date = f"{season_year}-01-01"
+    key = ("_player_transactions", person_id, start_date, str(end_date))
+    if key in cache:
+        return cache[key]
+    try:
+        data = core.request_json_with_retry(_transactions_url(person_id, start_date, end_date))
+        result = ([t for t in (data.get("transactions") or []) if isinstance(t, dict)], True)
+    except Exception:
+        result = ([], False)
+    cache[key] = result
+    return result
+
+
+def latest_prior_transaction_date(person_id: int, current_tx: dict, predicate, cache=None):
+    current_date = core.txn_date_obj(current_tx)
+    if not current_date:
+        return None
+    txs, ok = fetch_player_transactions(person_id, current_date.year, current_date, cache=cache)
+    if not ok:
+        return None
+
+    current_id = core.txn_id(current_tx)
+    candidates = []
+    for hist in txs:
+        if current_id and core.txn_id(hist) == current_id:
+            continue
+        hist_date = core.txn_date_obj(hist)
+        if not hist_date or hist_date > current_date:
+            continue
+        if predicate(hist):
+            candidates.append((hist_date, core.txn_id(hist)))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][0]
 
 
 def _meaningful_mlb_sample(stat: dict, pitcher: bool):
@@ -178,22 +315,11 @@ def _sample_only_clause(stat: dict, pitcher: bool):
     return f"MLB: {pa} PA" if pa is not None else None
 
 
-def _selected_stats_labels(selected: dict):
-    if not selected:
-        return None, None
-    season = selected.get("seasonYear")
-    level = core._clean_text(selected.get("levelToken"))
-    # Keep signing labels simple. A player may have played for multiple clubs at
-    # the same level in a season, so naming one team can be misleading.
-    base = " ".join(str(x) for x in (season, level) if x) or "Stats"
-    return base, base
-
-
 def _age_years(birth_date_str: str):
     if not birth_date_str:
         return None
     try:
-        b = core.datetime.strptime(str(birth_date_str)[:10], "%Y-%m-%d").date()
+        b = datetime.strptime(str(birth_date_str)[:10], "%Y-%m-%d").date()
     except Exception:
         return None
     t = core.today_pacific_date()
@@ -201,44 +327,49 @@ def _age_years(birth_date_str: str):
     return age if age >= 0 else None
 
 
-def build_signing_enrichment(person: dict, stats_blocks=None):
-    pitcher = core.is_pitcher(person)
-    blocks = stats_blocks if stats_blocks is not None else (person.get("stats") or [])
-    current_year = core.today_pacific_date().year
+def _signing_season_context(person_id: int, pitcher: bool, season: int):
+    mlb, mlb_ok = fetch_player_stat(person_id, pitcher, 1, "season", season)
+    milb, milb_ok = fetch_highest_milb_stat(person_id, pitcher, "season", season)
+    return mlb, milb, (mlb_ok or milb_ok)
 
-    # Relevance order for a signing:
-    # 1) meaningful MLB work this season
-    # 2) this season's highest MiLB level (with tiny MLB exposure disclosed)
-    # 3) if there is no current-season MiLB work, fall back to the latest
-    #    meaningful MLB sample, then the latest MiLB/MLB sample.
-    current_mlb = select_mlb_appeared(blocks, pitcher=pitcher, season=current_year)
-    current_milb = select_highest_milb_appeared(blocks, pitcher=pitcher, season=current_year)
-    latest_mlb = select_mlb_appeared(blocks, pitcher=pitcher)
-    latest_milb = select_highest_milb_appeared(blocks, pitcher=pitcher)
+
+def build_signing_enrichment(person: dict, stats_blocks=None):
+    """Choose signing context by relevance, not by whatever bio fields exist."""
+    pitcher = core.is_pitcher(person)
+    person_id = core._safe_int(person.get("id"))
+    current_year = core.today_pacific_date().year
 
     primary = None
     secondary = None
-    if current_mlb and _meaningful_mlb_sample(current_mlb.get("splitStats") or {}, pitcher):
-        primary = current_mlb
-    elif current_milb:
-        primary = current_milb
-        if current_mlb:
-            secondary = _sample_only_clause(current_mlb.get("splitStats") or {}, pitcher)
-    elif current_mlb:
-        primary = current_mlb
-    elif latest_mlb and _meaningful_mlb_sample(latest_mlb.get("splitStats") or {}, pitcher):
-        primary = latest_mlb
-    elif latest_milb:
-        primary = latest_milb
-        if latest_mlb:
-            secondary = _sample_only_clause(latest_mlb.get("splitStats") or {}, pitcher)
-    elif latest_mlb:
-        primary = latest_mlb
+    if person_id:
+        current_mlb, current_milb, _ok = _signing_season_context(person_id, pitcher, current_year)
+
+        if current_mlb and _meaningful_mlb_sample(current_mlb.get("splitStats") or {}, pitcher):
+            primary = current_mlb
+        elif current_milb:
+            primary = current_milb
+            if current_mlb:
+                secondary = _sample_only_clause(current_mlb.get("splitStats") or {}, pitcher)
+        elif current_mlb:
+            primary = current_mlb
+        else:
+            # Useful for offseason signings before the new season has data.
+            prev_mlb, prev_milb, _ok = _signing_season_context(person_id, pitcher, current_year - 1)
+            if prev_mlb and _meaningful_mlb_sample(prev_mlb.get("splitStats") or {}, pitcher):
+                primary = prev_mlb
+            elif prev_milb:
+                primary = prev_milb
+                if prev_mlb:
+                    secondary = _sample_only_clause(prev_mlb.get("splitStats") or {}, pitcher)
+            elif prev_mlb:
+                primary = prev_mlb
 
     primary_stats = format_stat_clause((primary or {}).get("splitStats") or {}, pitcher) if primary else None
-    label_full, label_short = _selected_stats_labels(primary)
+    season = (primary or {}).get("seasonYear")
+    level = core._clean_text((primary or {}).get("levelToken"))
+    label = " ".join(str(x) for x in (season, level) if x) or None
 
-    # Draft/school are fallback context only when there is no useful pro line.
+    # Draft/school are fallback-only for players with no useful pro stat line.
     fallback = []
     if not primary_stats:
         draft = core.draft_clause(person)
@@ -252,8 +383,8 @@ def build_signing_enrichment(person: dict, stats_blocks=None):
         "pitcher": pitcher,
         "age": _age_years(person.get("birthDate")),
         "primary_stats": primary_stats,
-        "primary_label_full": label_full,
-        "primary_label_short": label_short,
+        "primary_label_full": label,
+        "primary_label_short": label,
         "secondary": secondary,
         "fallback": fallback,
     }
@@ -263,12 +394,11 @@ def build_signing_post(base_text: str, player_link: str, enrichment: dict, max_l
     pitcher = bool(enrichment.get("pitcher"))
     age = enrichment.get("age")
     primary_stats = enrichment.get("primary_stats")
-    label_full = enrichment.get("primary_label_full")
-    label_short = enrichment.get("primary_label_short")
+    label = enrichment.get("primary_label_short") or enrichment.get("primary_label_full")
     secondary = enrichment.get("secondary")
     fallback = list(enrichment.get("fallback") or [])
 
-    def render(label, stats, *, include_secondary=True, include_age=True, fallback_lines=None):
+    def render(stats, *, include_secondary=True, include_age=True, fallback_lines=None):
         lines = [base_text]
         if stats and label:
             lines.append(f"{label}: {stats}")
@@ -284,27 +414,17 @@ def build_signing_post(base_text: str, player_link: str, enrichment: dict, max_l
         return "\n".join(lines)
 
     attempts = [
-        render(label_full, primary_stats, fallback_lines=fallback),
-        render(label_short or label_full, primary_stats, fallback_lines=fallback),
-        render(label_short or label_full, primary_stats, include_secondary=False, fallback_lines=fallback),
+        render(primary_stats, fallback_lines=fallback),
+        render(primary_stats, include_secondary=False, fallback_lines=fallback),
     ]
     short_stats = shorten_stat_clause(primary_stats, pitcher) if primary_stats else None
     if short_stats and short_stats != primary_stats:
-        attempts.append(
-            render(label_short or label_full, short_stats, include_secondary=False, fallback_lines=fallback)
-        )
-    attempts.extend(
-        [
-            render(label_short or label_full, short_stats or primary_stats, include_secondary=False, fallback_lines=[]),
-            render(
-                label_short or label_full,
-                short_stats or primary_stats,
-                include_secondary=False,
-                include_age=False,
-                fallback_lines=[],
-            ),
-        ]
-    )
+        attempts.append(render(short_stats, include_secondary=False, fallback_lines=fallback))
+    attempts.extend([
+        render(short_stats or primary_stats, include_secondary=False, fallback_lines=[]),
+        render(short_stats or primary_stats, include_secondary=False, include_age=False, fallback_lines=[]),
+    ])
+
     for post in attempts:
         if len(post) <= max_len:
             return post
@@ -313,7 +433,8 @@ def build_signing_post(base_text: str, player_link: str, enrichment: dict, max_l
     return min_post if len(min_post) <= max_len else min_post[: max_len - 1] + "…"
 
 
-def build_post_with_optional_stats(base_text: str, player_link: str, stats_line: str, pitcher: bool, max_len=core.MAX_POST_LEN):
+def build_post_with_optional_stats(base_text: str, player_link: str, stats_line: str,
+                                   pitcher: bool, max_len=core.MAX_POST_LEN):
     if stats_line:
         post = f"{base_text}\n{stats_line}\n{player_link}"
         if len(post) <= max_len:
@@ -333,32 +454,6 @@ def build_post_with_optional_stats(base_text: str, player_link: str, stats_line:
 
 def _short_date_label(d):
     return f"{d.strftime('%b')} {d.day}" if d else None
-
-
-def _person_transactions(person: dict):
-    txs = person.get("transactions") or []
-    return [t for t in txs if isinstance(t, dict)] if isinstance(txs, list) else []
-
-
-def latest_prior_transaction_date(person: dict, current_tx: dict, predicate):
-    current_date = core.txn_date_obj(current_tx)
-    if not current_date:
-        return None
-    current_id = core.txn_id(current_tx)
-    candidates = []
-    for hist in _person_transactions(person):
-        hist_date = core.txn_date_obj(hist)
-        if not hist_date or hist_date > current_date:
-            continue
-        hist_id = core.txn_id(hist)
-        if hist_date == current_date and (not hist_id or not current_id or hist_id >= current_id):
-            continue
-        if predicate(hist):
-            candidates.append((hist_date, hist_id))
-    if not candidates:
-        return None
-    candidates.sort(reverse=True)
-    return candidates[0][0]
 
 
 def _labeled_stats(selected: dict, prefix: str, pitcher: bool):
@@ -383,55 +478,72 @@ def build_special_transaction_post(tx: dict, category: str, player_cache: dict, 
 
     if category == "optioned":
         start = latest_prior_transaction_date(
-            details,
+            pid,
             tx,
-            lambda hist: core.is_recalled_transaction(hist) or core.is_contract_selected_transaction(hist),
+            lambda hist: core.is_recalled_transaction(hist) or is_contract_selected_transaction(hist),
+            cache=player_cache,
         )
         if start:
-            payload = core.get_player_by_date_range(pid, season_year, start.isoformat(), tx_date.isoformat(), player_cache)
-            sel = select_mlb_appeared(payload.get("stats") or [], pitcher)
+            sel, ok = fetch_player_stat(
+                pid, pitcher, 1, "byDateRange", season_year,
+                cache=player_cache, start_date=start, end_date=tx_date,
+            )
             stats_line = _labeled_stats(sel, f"MLB since {_short_date_label(start)}", pitcher)
-            # A successful hydrated response with an explicit empty stats list means
-            # the player was on the MLB roster for the stint but never appeared.
-            if not stats_line and payload and "stats" in payload:
+            if not stats_line and ok:
                 stats_line = f"MLB since {_short_date_label(start)}: did not appear"
         if not stats_line:
-            payload = core.get_player_season_stats(pid, season_year, player_cache)
-            sel = select_mlb_appeared(payload.get("stats") or [], pitcher, season=season_year)
+            sel, _ok = fetch_player_stat(
+                pid, pitcher, 1, "season", season_year, cache=player_cache,
+            )
             stats_line = _labeled_stats(sel, f"{season_year} MLB", pitcher)
 
     elif category == "recalled":
-        start = latest_prior_transaction_date(details, tx, core.is_optioned_transaction)
+        start = latest_prior_transaction_date(
+            pid, tx, core.is_optioned_transaction, cache=player_cache,
+        )
         if start:
-            payload = core.get_player_by_date_range(pid, season_year, start.isoformat(), tx_date.isoformat(), player_cache)
-            sel = select_highest_milb_appeared(payload.get("stats") or [], pitcher)
+            sel, _ok = fetch_highest_milb_stat(
+                pid, pitcher, "byDateRange", season_year,
+                cache=player_cache, start_date=start, end_date=tx_date,
+            )
             if sel:
                 level = core._clean_text(sel.get("levelToken")) or "MiLB"
                 stats_line = _labeled_stats(sel, f"{level} since {_short_date_label(start)}", pitcher)
         if not stats_line:
-            payload = core.get_player_season_stats(pid, season_year, player_cache)
-            sel = select_highest_milb_appeared(payload.get("stats") or [], pitcher, season=season_year)
+            sel, _ok = fetch_highest_milb_stat(
+                pid, pitcher, "season", season_year, cache=player_cache,
+            )
             if sel:
                 level = core._clean_text(sel.get("levelToken")) or "MiLB"
                 stats_line = _labeled_stats(sel, f"{season_year} {level}", pitcher)
 
     elif category == "dfa":
-        payload = core.get_player_season_stats(pid, season_year, player_cache)
-        sel = select_mlb_appeared(payload.get("stats") or [], pitcher, season=season_year)
+        sel, _ok = fetch_player_stat(
+            pid, pitcher, 1, "season", season_year, cache=player_cache,
+        )
         stats_line = _labeled_stats(sel, f"{season_year} MLB", pitcher)
 
     elif category == "contract_selected":
-        payload = core.get_player_season_stats(pid, season_year, player_cache)
-        sel = select_highest_milb_appeared(payload.get("stats") or [], pitcher, season=season_year)
+        # Date-range season-to-date avoids future leakage when replaying old
+        # transactions and still represents the player's performance at call-up.
+        sel, _ok = fetch_highest_milb_stat(
+            pid, pitcher, "byDateRange", season_year,
+            cache=player_cache,
+            start_date=f"{season_year}-01-01",
+            end_date=tx_date,
+        )
         if sel:
             level = core._clean_text(sel.get("levelToken")) or "MiLB"
             stats_line = _labeled_stats(sel, f"{season_year} {level}", pitcher)
 
-    return build_post_with_optional_stats(base_text, link, stats_line, pitcher, max_len=core.MAX_POST_LEN)
+    return build_post_with_optional_stats(
+        base_text, link, stats_line, pitcher, max_len=core.MAX_POST_LEN,
+    )
 
 
 def apply_overrides():
     core.is_signing_transaction = is_signing_transaction
+    core.is_contract_selected_transaction = is_contract_selected_transaction
     core.format_stat_clause = format_stat_clause
     core.shorten_stat_clause = shorten_stat_clause
     core.build_signing_enrichment = build_signing_enrichment
