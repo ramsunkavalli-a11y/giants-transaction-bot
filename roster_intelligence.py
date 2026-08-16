@@ -132,14 +132,73 @@ def _is_removal_from_40man(tx: dict, team_id: int, person_id: int) -> bool:
     return False
 
 
+def _generic_40man_state_change(tx: dict):
+    """Return True/False when a transaction clearly establishes 40-man state."""
+    if domain.is_contract_selected_transaction(tx):
+        return True
+    if domain.is_claimed_off_waivers_transaction(tx):
+        return True
+    if is_d60_return_transaction(tx):
+        return True
+
+    if domain.is_dfa_transaction(tx):
+        return False
+    if domain.is_outrighted_transaction(tx):
+        return False
+    if domain.is_released_transaction(tx):
+        return False
+    if domain.is_declared_free_agency_transaction(tx):
+        return False
+    if is_d60_create_transaction(tx):
+        return False
+
+    # A clearly identified MLB contract creates a 40-man spot.  Generic/minor
+    # free-agent signings intentionally remain unknown.
+    if domain.is_signing_transaction(tx):
+        hay = f"{tx.get('typeDesc','')} {tx.get('description','')}".lower()
+        if "major league contract" in hay:
+            return True
+    return None
+
+
+def recent_player_40man_state(person_id: int, before_date, cache=None,
+                              lookback_days: int = 730):
+    """Infer a player's 40-man state immediately before a date from tx history.
+
+    This is a fallback for roster-feed omissions, not the primary source.  A
+    trade itself preserves the previously known state; option/recall/assignment
+    transactions do not change it.
+    """
+    cache = cache if cache is not None else {}
+    before = _as_date(before_date)
+    if not before:
+        return None, False
+    end = before - timedelta(days=1)
+    start = end - timedelta(days=max(1, int(lookback_days)))
+    history, ok = domain.fetch_player_transactions(
+        person_id, start, end, cache=cache
+    )
+    if not ok:
+        return None, False
+    state = None
+    for hist in sorted(
+        history,
+        key=lambda item: (infra.txn_date_obj(item) or date.min, infra.txn_id(item)),
+    ):
+        change = _generic_40man_state_change(hist)
+        if change is not None:
+            state = change
+    return state, True
+
+
 def build_trade_exception_windows(team_id: int, start_date, end_date, cache=None):
     """Find recently acquired players who should still occupy a 40-man spot.
 
-    For each incoming trade, verify that the player was on the previous MLB
-    club's 40-man the day before the trade.  If so, keep him as a counting
-    member until a later transaction explicitly removes him from the acquiring
-    club's 40-man.  This repairs temporary roster-feed omissions without
-    hard-coding a player name.
+    Primary proof is the previous club's historical 40-man roster.  If that
+    feed is itself missing the player, direct transaction history can provide a
+    second proof path (e.g. selected to the 40-man with no later removal).
+    Once verified, the player remains counting until a later explicit 40-man
+    removal.  No player names are hard-coded.
     """
     cache = cache if cache is not None else {}
     start = _as_date(start_date)
@@ -167,15 +226,20 @@ def build_trade_exception_windows(team_id: int, start_date, end_date, cache=None
         tx_date = infra.txn_date_obj(tx)
         if to_id != int(team_id) or not from_id or not pid or not tx_date:
             continue
-        key_in = (pid, tx_date)
-        incoming[key_in] = (tx, from_id)
+        incoming[(pid, tx_date)] = (tx, from_id)
 
     windows = []
     for (pid, trade_date), (tx, from_id) in incoming.items():
         previous_members, prior_ok = fetch_40man_members(
             from_id, trade_date - timedelta(days=1), cache=cache
         )
-        if not prior_ok or pid not in previous_members:
+        known_on_40man = bool(prior_ok and pid in previous_members)
+        if not known_on_40man:
+            inferred, infer_ok = recent_player_40man_state(
+                pid, trade_date, cache=cache
+            )
+            known_on_40man = bool(infer_ok and inferred is True)
+        if not known_on_40man:
             continue
 
         player_txs, hist_ok = domain.fetch_player_transactions(
@@ -199,7 +263,11 @@ def build_trade_exception_windows(team_id: int, start_date, end_date, cache=None
                 removal = hist_date
                 break
 
-        name = previous_members.get(pid) or str(pid)
+        name = (
+            previous_members.get(pid)
+            or infra._clean_text(infra._get_in(tx, "person", "fullName"))
+            or str(pid)
+        )
         windows.append({
             "person_id": pid,
             "name": name,
@@ -261,6 +329,41 @@ def adjusted_40man_count(team_id: int, as_of_date=None, cache=None,
         lookback_days=lookback_days,
     )
     return (len(members) if ok else None), additions, ok
+
+
+def daily_40man_counts(team_id: int, start_date, end_date, cache=None):
+    """Return adjusted end-of-day occupancy for every calendar day in range."""
+    cache = cache if cache is not None else {}
+    start = _as_date(start_date)
+    end = _as_date(end_date)
+    if not start or not end or end < start:
+        return {}, {}, False
+
+    windows, windows_ok = build_trade_exception_windows(
+        team_id, start, end, cache=cache
+    )
+    if not windows_ok:
+        windows = []
+
+    counts = {}
+    reconciliations = {}
+    d = start
+    while d <= end:
+        count, additions, ok = adjusted_40man_count(
+            team_id,
+            as_of_date=d,
+            cache=cache,
+            trade_windows=windows,
+        )
+        if not ok or count is None:
+            return {}, {}, False
+        # StatsAPI can very occasionally expose a transient historical >40
+        # state.  For an open-spot question that is unambiguously "not open."
+        counts[d] = min(40, count)
+        if additions:
+            reconciliations[d] = additions
+        d += timedelta(days=1)
+    return counts, reconciliations, True
 
 
 def regular_season_start(team_id: int, season: int, cache=None):
