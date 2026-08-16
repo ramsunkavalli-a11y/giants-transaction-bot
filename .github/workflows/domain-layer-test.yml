@@ -1,0 +1,124 @@
+name: Domain layer validation
+
+on:
+  push:
+    branches:
+      - agent/enrichment-formatting-v1
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Compile modular build
+        run: python -m py_compile bot.py bot_core.py mlb_domain.py post_builder.py
+      - name: Validate domain semantics and real transactions
+        run: |
+          python - <<'PY'
+          from datetime import datetime
+          import bot_core as infra
+          import mlb_domain as domain
+          import post_builder
+
+          # Real StatsAPI semantics discovered from 2026 transaction data.
+          assert domain.is_contract_selected_transaction({
+              "typeCode": "SE",
+              "typeDesc": "Selected",
+              "description": "San Francisco Giants selected the contract of CF Test Player."
+          })
+          assert not domain.is_signing_transaction({
+              "typeCode": "SE",
+              "typeDesc": "Selected",
+              "description": "San Francisco Giants selected the contract of CF Test Player."
+          })
+          assert not domain.is_signing_transaction({
+              "typeCode": "SC",
+              "typeDesc": "Status Change",
+              "description": "San Francisco Giants activated CF Test Player from the 10-day injured list."
+          })
+          assert domain.is_recalled_transaction({
+              "typeCode": "CU",
+              "typeDesc": "Recalled",
+              "description": "San Francisco Giants recalled CF Test Player from Sacramento River Cats."
+          })
+          assert domain.is_dfa_transaction({
+              "typeCode": "DES",
+              "typeDesc": "Designated",
+              "description": "San Francisco Giants designated SS Test Player for assignment."
+          })
+
+          # The new build is direct composition, not monkey-patching bot_core.
+          assert post_builder.build_posts is not infra.build_posts
+
+          data = infra.request_json_with_retry(
+              "https://statsapi.mlb.com/api/v1/transactions"
+              "?teamId=137&startDate=2026-08-01&endDate=2026-08-14"
+          )
+          txns = data.get("transactions") or []
+
+          def find(piece, date):
+              matches = [
+                  tx for tx in txns
+                  if piece.lower() in infra.txn_desc(tx).lower()
+                  and infra.txn_date(tx) == date
+              ]
+              assert matches, (piece, date)
+              return sorted(matches, key=infra.txn_id)[0]
+
+          def render(piece, date):
+              tx = find(piece, date)
+              result = post_builder.build_posts(
+                  [tx], player_cache={}, season_mode=True,
+                  now_la=datetime(2026, 8, 16, 10, 0, 0),
+              )
+              assert len(result) == 1, result
+              post = result[0]
+              assert len(post) <= infra.MAX_POST_LEN
+              print("\n" + "=" * 78)
+              print(infra.txn_typecode(tx), infra.txn_desc(tx))
+              print(post)
+              return post
+
+          activation = render("activated CF Jonah Cox", "2026-08-04")
+          assert "Age " not in activation and "2026 AAA:" not in activation
+
+          furman_selected = render("selected the contract of 2B Nate Furman", "2026-08-01")
+          assert "2026 AAA:" in furman_selected
+
+          harris_selected = render("selected the contract of RHP Trent Harris", "2026-08-07")
+          assert "2026 AAA: 40.1 IP, 37 H, 3.12 ERA, 52 K, 18 BB" in harris_selected
+
+          hill_selected = render("selected the contract of CF Turner Hill", "2026-08-13")
+          assert ".353/.420/.529" in hill_selected
+
+          mccray_option = render("optioned CF Grant McCray", "2026-08-14")
+          assert "MLB since Jul 10: 47 PA, .081/.227/.162, 1 HR, 28% K, 15% BB" in mccray_option
+
+          furman_option = render("optioned 2B Nate Furman", "2026-08-14")
+          assert "MLB since Aug 1: 8 PA, .000/.250/.000, 0 HR, 12% K, 25% BB" in furman_option
+
+          morgan_option = render("optioned C Zach Morgan", "2026-08-11")
+          assert "MLB since Aug 10: did not appear" in morgan_option
+
+          cox_recall = render("recalled CF Jonah Cox", "2026-08-14")
+          assert "AAA since Aug 4: 34 PA, .533/.588/.767, 1 HR, 12% K, 12% BB" in cox_recall
+
+          leonard_dfa = render("designated SS Eddys Leonard for assignment", "2026-08-11")
+          assert "2026 MLB:" in leonard_dfa
+
+          knizner = render("signed free agent C Andrew Knizner", "2026-08-11")
+          assert "2026 AAA: 234 PA, .294/.393/.552, 12 HR, 17% K, 12% BB" in knizner
+          # His later Giants PA must not leak backward into the signing post.
+          assert "MLB: 4 PA" not in knizner, knizner
+          assert "Age 31" in knizner
+          assert "drafted by" not in knizner and "went to" not in knizner
+
+          print("\nMODULAR REAL-DATA VALIDATION PASSED")
+          PY
