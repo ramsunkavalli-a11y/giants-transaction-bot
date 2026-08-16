@@ -40,6 +40,7 @@ jobs:
           python bot.py
 
       - name: Commit bot state (last_id.txt + seen_ids.txt)
+        if: always()
         run: |
           set -e
 
