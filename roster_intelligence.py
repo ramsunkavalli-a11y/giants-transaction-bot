@@ -162,12 +162,11 @@ def _generic_40man_state_change(tx: dict):
 
 
 def recent_player_40man_state(person_id: int, before_date, cache=None,
-                              lookback_days: int = 730):
-    """Infer a player's 40-man state immediately before a date from tx history.
+                              lookback_days: int = 1825):
+    """Infer 40-man state immediately before a date from transaction history.
 
-    This is a fallback for roster-feed omissions, not the primary source.  A
-    trade itself preserves the previously known state; option/recall/assignment
-    transactions do not change it.
+    This is independent confirmation for roster-feed reconciliation.  Trades,
+    options, recalls and minor-league assignments preserve the last known state.
     """
     cache = cache if cache is not None else {}
     before = _as_date(before_date)
@@ -192,13 +191,13 @@ def recent_player_40man_state(person_id: int, before_date, cache=None,
 
 
 def build_trade_exception_windows(team_id: int, start_date, end_date, cache=None):
-    """Find recently acquired players who should still occupy a 40-man spot.
+    """Find incoming trades with independently verified 40-man membership.
 
-    Primary proof is the previous club's historical 40-man roster.  If that
-    feed is itself missing the player, direct transaction history can provide a
-    second proof path (e.g. selected to the 40-man with no later removal).
-    Once verified, the player remains counting until a later explicit 40-man
-    removal.  No player names are hard-coded.
+    StatsAPI's historical ``40Man`` feed can itself include false positives, so
+    appearance on the previous club's roster is not enough.  We require both:
+    (1) the player appears on that prior-club snapshot, and (2) direct player
+    transaction history says his last known 40-man state was ON.  Once verified,
+    the state carries through the trade until a later explicit removal.
     """
     cache = cache if cache is not None else {}
     start = _as_date(start_date)
@@ -233,13 +232,15 @@ def build_trade_exception_windows(team_id: int, start_date, end_date, cache=None
         previous_members, prior_ok = fetch_40man_members(
             from_id, trade_date - timedelta(days=1), cache=cache
         )
-        known_on_40man = bool(prior_ok and pid in previous_members)
-        if not known_on_40man:
-            inferred, infer_ok = recent_player_40man_state(
-                pid, trade_date, cache=cache
-            )
-            known_on_40man = bool(infer_ok and inferred is True)
-        if not known_on_40man:
+        inferred, infer_ok = recent_player_40man_state(
+            pid, trade_date, cache=cache
+        )
+        if not (
+            prior_ok
+            and pid in previous_members
+            and infer_ok
+            and inferred is True
+        ):
             continue
 
         player_txs, hist_ok = domain.fetch_player_transactions(
@@ -328,7 +329,9 @@ def adjusted_40man_count(team_id: int, as_of_date=None, cache=None,
         trade_windows=trade_windows,
         lookback_days=lookback_days,
     )
-    return (len(members) if ok else None), additions, ok
+    # >40 historical snapshots are a StatsAPI sequencing artifact.  They are
+    # useful for diagnostics but can never be a valid published roster count.
+    return (min(40, len(members)) if ok else None), additions, ok
 
 
 def daily_40man_counts(team_id: int, start_date, end_date, cache=None):
@@ -357,9 +360,7 @@ def daily_40man_counts(team_id: int, start_date, end_date, cache=None):
         )
         if not ok or count is None:
             return {}, {}, False
-        # StatsAPI can very occasionally expose a transient historical >40
-        # state.  For an open-spot question that is unambiguously "not open."
-        counts[d] = min(40, count)
+        counts[d] = count
         if additions:
             reconciliations[d] = additions
         d += timedelta(days=1)
