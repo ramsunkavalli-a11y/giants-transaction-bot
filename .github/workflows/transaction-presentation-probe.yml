@@ -1,4 +1,4 @@
-name: Transaction presentation probe
+name: Transaction presentation patch
 
 on:
   push:
@@ -6,45 +6,42 @@ on:
       - agent/enrichment-formatting-v1
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  probe:
+  patch:
+    if: github.event.head_commit.message == 'Apply waiver claim and number filtering'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -r requirements.txt
-      - name: Preview incoming waiver claim enrichment
+      - name: Apply presentation changes
         run: |
           python - <<'PY'
-          from datetime import datetime
-          import bot_core as infra
-          import mlb_domain as domain
-          import post_builder
+          from pathlib import Path
 
-          data = infra.request_json_with_retry(
-              "https://statsapi.mlb.com/api/v1/transactions"
-              "?teamId=137&startDate=2026-06-01&endDate=2026-08-16"
-          )
-          txns = data.get("transactions") or []
-          wanted = {672021, 671083, 694376}
-          for tx in txns:
-              if (tx.get("typeCode") or "").upper() != "CLW":
-                  continue
-              if infra._safe_int((tx.get("toTeam") or {}).get("id")) != 137:
-                  continue
-              pid = infra.extract_tx_player_id(tx)
-              if pid not in wanted:
-                  continue
-              tx_date = infra.txn_date_obj(tx)
-              cache = {}
-              details = domain.fetch_player_details(pid, cache=cache)
-              enrichment = post_builder.build_signing_enrichment(details, tx_date, cache=cache)
-              post = post_builder.build_signing_post(
-                  infra.build_base_tx_text(tx), infra.player_url(pid), enrichment
-              )
-              print("\n" + "=" * 80 + "\n" + post)
+          path = Path('post_builder.py')
+          text = path.read_text()
+          old = '''    for tx in sorted(new_txns, key=infra.txn_id):\n        category = domain.classify_transaction(tx, season_mode=season_mode)\n\n        if category == "signing":\n'''
+          new = '''    for tx in sorted(new_txns, key=infra.txn_id):\n        # Jersey-number changes are administrative noise, including the mass\n        # Jackie Robinson Day switch to No. 42. Marking fetched IDs seen is\n        # handled by bot.py even when this builder intentionally emits nothing.\n        if domain.is_number_change_transaction(tx):\n            continue\n\n        # Incoming waiver claims benefit from the same date-bounded player\n        # context used for signings. Outgoing claims remain grouped/plain so a\n        # DFA followed by a claim does not repeat the same player evaluation.\n        if (\n            domain.is_claimed_off_waivers_transaction(tx)\n            and infra._safe_int(infra._get_in(tx, "toTeam", "id")) == infra.TEAM_ID\n        ):\n            base_text = infra.build_base_tx_text(tx)\n            person_id = infra.extract_tx_player_id(tx)\n            if not person_id:\n                separate_posts.append(base_text)\n                continue\n            details = domain.fetch_player_details(person_id, cache=cache)\n            tx_date = infra.txn_date_obj(tx) or now_la.date()\n            enrichment = build_signing_enrichment(details, tx_date, cache=cache)\n            separate_posts.append(\n                build_signing_post(\n                    base_text,\n                    infra.player_url(person_id),\n                    enrichment,\n                    max_len=infra.MAX_POST_LEN,\n                )\n            )\n            continue\n\n        category = domain.classify_transaction(tx, season_mode=season_mode)\n\n        if category == "signing":\n'''
+          if old not in text:
+              raise SystemExit('Expected build_posts loop not found')
+          path.write_text(text.replace(old, new, 1))
+
+          test_path = Path('tests/test_transaction_presentation.py')
+          test_path.write_text('''import unittest\nfrom datetime import datetime\nfrom unittest.mock import patch\n\nimport post_builder\n\n\nclass TransactionPresentationTests(unittest.TestCase):\n    def test_number_changes_are_suppressed(self):\n        number = {\n            "id": 1, "date": "2026-04-15", "typeCode": "NUM",\n            "typeDesc": "Number Change",\n            "description": "CF Test Player changed number to 42.",\n        }\n        self.assertEqual(\n            post_builder.build_posts(\n                [number], season_mode=True, now_la=datetime(2026, 4, 15)\n            ),\n            [],\n        )\n\n    def test_mixed_group_omits_number_change(self):\n        number = {\n            "id": 1, "date": "2026-04-15", "typeCode": "NUM",\n            "description": "CF Test Player changed number to 42.",\n        }\n        status = {\n            "id": 2, "date": "2026-04-15", "typeCode": "SC",\n            "typeDesc": "Status Change",\n            "description": "San Francisco Giants activated CF Test Player.",\n        }\n        posts = post_builder.build_posts(\n            [number, status], season_mode=True, now_la=datetime(2026, 4, 15)\n        )\n        joined = "\\n".join(posts)\n        self.assertIn("activated CF Test Player", joined)\n        self.assertNotIn("changed number", joined)\n\n    def test_incoming_claim_uses_enriched_separate_post(self):\n        claim = {\n            "id": 3, "date": "2026-08-02", "typeCode": "CLW",\n            "typeDesc": "Claimed Off Waivers",\n            "description": "San Francisco Giants claimed 1B Test Player off waivers from Seattle Mariners.",\n            "person": {"id": 123, "fullName": "Test Player"},\n            "fromTeam": {"id": 136, "name": "Seattle Mariners"},\n            "toTeam": {"id": 137, "name": "San Francisco Giants"},\n        }\n        enrichment = {\n            "pitcher": False, "age": 27,\n            "primary_stats": "218 PA, .321/.424/.543, 8 HR, 12% K, 12% BB",\n            "primary_label": "2026 AAA", "secondary": "MLB: 19 PA",\n            "fallback": [],\n        }\n        with patch.object(post_builder.domain, "fetch_player_details", return_value={"id": 123}), \\\n             patch.object(post_builder, "build_signing_enrichment", return_value=enrichment):\n            posts = post_builder.build_posts(\n                [claim], season_mode=True, now_la=datetime(2026, 8, 2)\n            )\n        self.assertEqual(len(posts), 1)\n        self.assertIn("claimed 1B Test Player off waivers", posts[0])\n        self.assertIn("2026 AAA: 218 PA, .321/.424/.543", posts[0])\n        self.assertIn("MLB: 19 PA | Age 27", posts[0])\n\n    def test_outgoing_claim_remains_plain_grouped(self):\n        claim = {\n            "id": 4, "date": "2026-06-23", "typeCode": "CLW",\n            "typeDesc": "Claimed Off Waivers",\n            "description": "New York Mets claimed CF Test Player off waivers from San Francisco Giants.",\n            "person": {"id": 123, "fullName": "Test Player"},\n            "fromTeam": {"id": 137, "name": "San Francisco Giants"},\n            "toTeam": {"id": 121, "name": "New York Mets"},\n        }\n        with patch.object(post_builder.domain, "fetch_player_details") as details:\n            posts = post_builder.build_posts(\n                [claim], season_mode=True, now_la=datetime(2026, 6, 23)\n            )\n        details.assert_not_called()\n        self.assertEqual(len(posts), 1)\n        self.assertIn("New York Mets claimed CF Test Player off waivers", posts[0])\n        self.assertNotIn("https://www.mlb.com/player/123", posts[0])\n\n\nif __name__ == "__main__":\n    unittest.main()\n''')
           PY
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add post_builder.py tests/test_transaction_presentation.py
+          git diff --cached --check
+          python -m py_compile post_builder.py tests/test_transaction_presentation.py
+          python -m unittest tests.test_transaction_presentation -v
+          git commit -m "Enrich incoming waiver claims and suppress number changes"
+          git push origin HEAD:agent/enrichment-formatting-v1
