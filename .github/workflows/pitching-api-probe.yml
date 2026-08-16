@@ -17,60 +17,32 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - name: Probe real Giants optioned pitchers
+      - name: Probe raw sabermetrics for real option stints
         run: |
           python - <<'PY'
-          from datetime import date
           import json
+          from urllib.parse import urlencode
           import bot_core as infra
-          import mlb_domain as domain
-          import statcast_domain as statcast
 
-          data = infra.request_json_with_retry(
-              "https://statsapi.mlb.com/api/v1/transactions"
-              "?teamId=137&startDate=2026-03-01&endDate=2026-08-16"
-          )
-          txns = data.get("transactions") or []
-          opts = []
-          for tx in txns:
-              if not domain.is_optioned_transaction(tx):
-                  continue
-              pid = infra.extract_tx_player_id(tx)
-              if not pid:
-                  continue
-              details = domain.fetch_player_details(pid, cache={})
-              if not infra.is_pitcher(details):
-                  continue
-              opts.append(tx)
-
-          print("OPTIONED PITCHER TXNS", len(opts))
-          for tx in sorted(opts, key=infra.txn_id, reverse=True)[:8]:
-              pid = infra.extract_tx_player_id(tx)
-              tx_date = infra.txn_date_obj(tx)
-              cache = {}
-              details = domain.fetch_player_details(pid, cache=cache)
-              name = details.get("fullName") or infra.txn_desc(tx)
-              start = domain.latest_prior_transaction_date(
-                  pid, tx,
-                  lambda h: domain.is_recalled_transaction(h) or domain.is_contract_selected_transaction(h),
-                  cache=cache,
-              )
-              if not start:
-                  start = date(tx_date.year, 1, 1)
-              regular, ok = domain.fetch_player_stat(
-                  pid, True, 1, "byDateRange", tx_date.year,
-                  cache=cache, start_date=start, end_date=tx_date,
-              )
-              saber, saber_ok = domain.fetch_player_stat(
-                  pid, True, 1, "sabermetrics", tx_date.year,
-                  cache=cache, start_date=start, end_date=tx_date,
-              )
-              usage, usage_ok = statcast.fetch_mlb_usage(
-                  pid, True, tx_date.year, start, tx_date, cache=cache
-              )
-              print("\n---", name, pid, tx_date, "since", start)
-              print("DESC", infra.txn_desc(tx))
-              print("REGULAR", json.dumps((regular or {}).get("splitStats") or {}, sort_keys=True))
-              print("SABER", json.dumps((saber or {}).get("splitStats") or {}, sort_keys=True))
-              print("USAGE", usage, "ok", usage_ok, "regular_ok", ok, "saber_ok", saber_ok)
+          cases = [
+              (676254, "Ryan Walker", "2026-06-12", "2026-07-09"),
+              (687931, "Carson Whisenhunt", "2026-07-09", "2026-07-10"),
+              (663941, "Tristan Beck", "2026-08-03", "2026-08-07"),
+          ]
+          for pid, name, start, end in cases:
+              params = urlencode({
+                  "stats": "sabermetrics",
+                  "group": "pitching",
+                  "sportId": 1,
+                  "season": 2026,
+                  "startDate": start,
+                  "endDate": end,
+              })
+              url = f"https://statsapi.mlb.com/api/v1/people/{pid}/stats?{params}"
+              data = infra.request_json_with_retry(url)
+              print("\n---", name, start, end)
+              for block in data.get("stats") or []:
+                  for split in block.get("splits") or []:
+                      print("team", (split.get("team") or {}).get("id"), (split.get("team") or {}).get("name"))
+                      print(json.dumps(split.get("stat") or {}, sort_keys=True))
           PY
