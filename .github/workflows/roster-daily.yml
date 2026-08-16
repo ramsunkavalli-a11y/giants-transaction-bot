@@ -1,0 +1,53 @@
+name: Giants 40-Man Daily
+
+on:
+  schedule:
+    # 11:15 PM Los Angeles in PDT/PST. The script only runs when local hour=23.
+    - cron: "15 6,7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: giants-40man-daily
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run 40-man daily tracker
+        env:
+          BSKY_IDENTIFIER: ${{ secrets.BSKY_IDENTIFIER }}
+          BSKY_APP_PASSWORD: ${{ secrets.BSKY_APP_PASSWORD }}
+        run: python roster_daily.py
+
+      - name: Commit 40-man tracker state
+        if: always()
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add roster_daily_state.json
+          if git diff --cached --quiet; then
+            echo "No 40-man state changes to commit"
+            exit 0
+          fi
+          git commit -m "Update 40-man daily state"
+          git pull --rebase origin main
+          git push origin main
