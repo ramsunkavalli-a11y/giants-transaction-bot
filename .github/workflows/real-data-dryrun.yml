@@ -17,41 +17,74 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - name: Render recent real transactions without posting
+      - name: Probe dedicated MLB stats endpoint
         run: |
           python - <<'PY'
-          from datetime import datetime
-          import bot
+          from urllib.parse import urlencode
           import bot_core as core
 
-          url = (
-              "https://statsapi.mlb.com/api/v1/transactions"
-              "?teamId=137&startDate=2026-08-01&endDate=2026-08-14"
-          )
-          data = core.request_json_with_retry(url)
-          txns = data.get("transactions") or []
-          names = (
-              "Turner Hill", "Jonah Cox", "Grant McCray", "Nate Furman",
-              "Andrew Knizner", "Zach Morgan", "Trent Harris", "Eddys Leonard",
-          )
-          selected = [t for t in txns if any(n.lower() in core.txn_desc(t).lower() for n in names)]
-          selected.sort(key=lambda t: (core.txn_date(t), core.txn_id(t)))
+          def stats_url(**params):
+              return "https://statsapi.mlb.com/api/v1/stats?" + urlencode(params)
 
-          print(f"Fetched {len(txns)} Giants transactions; matched {len(selected)} test transactions")
-          assert selected, "No test transactions matched"
+          def summarize(label, **params):
+              print("\n" + "=" * 80)
+              print(label)
+              print(params)
+              data = core.request_json_with_retry(stats_url(**params))
+              blocks = data.get("stats") or []
+              print("blocks:", len(blocks))
+              for block in blocks:
+                  print(" block type/group:", block.get("type"), block.get("group"), "splits", len(block.get("splits") or []))
+                  for split in (block.get("splits") or [])[:10]:
+                      st = split.get("stat") or {}
+                      print({
+                          "season": split.get("season"),
+                          "sport": split.get("sport"),
+                          "league": split.get("league"),
+                          "team": split.get("team"),
+                          "date": split.get("date"),
+                          "PA": st.get("plateAppearances"),
+                          "AVG": st.get("avg"),
+                          "OBP": st.get("obp"),
+                          "SLG": st.get("slg"),
+                          "HR": st.get("homeRuns"),
+                          "IP": st.get("inningsPitched"),
+                          "H": st.get("hits"),
+                          "ERA": st.get("era"),
+                          "K": st.get("strikeOuts"),
+                          "BB": st.get("baseOnBalls"),
+                      })
+              return data
 
-          for t in selected:
-              print("\n" + "=" * 78)
-              print("TX", core.txn_id(t), core.txn_date(t), core.txn_typecode(t), core.txn_desc(t))
-              posts = core.build_posts(
-                  [t],
-                  player_cache={},
-                  season_mode=True,
-                  now_la=datetime(2026, 8, 16, 10, 0, 0),
-              )
-              assert posts, f"No post rendered for transaction {core.txn_id(t)}"
-              for p in posts:
-                  print("POST:\n" + p)
-                  print("LENGTH:", len(p))
-                  assert len(p) <= core.MAX_POST_LEN, len(p)
+          sports = core.request_json_with_retry("https://statsapi.mlb.com/api/v1/sports")
+          print("SPORT IDS")
+          for s in sports.get("sports") or []:
+              if any(x in (s.get("name") or "").lower() for x in ("major", "triple", "double", "high", "single", "rookie")):
+                  print(s.get("id"), s.get("name"), s.get("abbreviation"))
+
+          summarize(
+              "Grant McCray MLB since Jul 10",
+              stats="byDateRange", group="hitting", personId=687529,
+              sportIds=1, season=2026, startDate="2026-07-10", endDate="2026-08-14",
+          )
+          summarize(
+              "Jonah Cox AAA since Aug 4",
+              stats="byDateRange", group="hitting", personId=813841,
+              sportIds=11, season=2026, startDate="2026-08-04", endDate="2026-08-14",
+          )
+          summarize(
+              "Andrew Knizner 2026 AAA",
+              stats="season", group="hitting", personId=668800,
+              sportIds=11, season=2026,
+          )
+          summarize(
+              "Trent Harris 2026 AAA",
+              stats="season", group="pitching", personId=805345,
+              sportIds=11, season=2026,
+          )
+          summarize(
+              "Turner Hill 2026 AAA",
+              stats="season", group="hitting", personId=806367,
+              sportIds=11, season=2026,
+          )
           PY
