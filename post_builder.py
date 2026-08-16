@@ -4,11 +4,13 @@ from datetime import datetime
 
 import bot_core as infra
 import mlb_domain as domain
+import pitching_domain as pitching
 import statcast_domain as statcast
 
 SIGNING_MLB_MIN_PA = 30
 SIGNING_MLB_MIN_IP = 10.0
 OPTION_XWOBA_MIN_PA = 40
+OPTION_PITCHER_MIN_OUTS = 30  # 10.0 IP
 
 
 def _format_pct(value):
@@ -308,6 +310,18 @@ def _option_usage_text(usage: dict | None):
     return f"{games} G ({starts} GS)"
 
 
+def _option_pitcher_usage_text(usage: dict | None):
+    if not usage:
+        return None
+    games = infra._safe_int(usage.get("games"))
+    starts = infra._safe_int(usage.get("starts"))
+    if games is None or games <= 0:
+        return None
+    if starts is not None and starts > 0:
+        return f"{games} G ({starts} GS)"
+    return f"{games} G"
+
+
 def _option_hitter_primary(prefix: str, stat: dict, usage=None):
     pa = infra._safe_int((stat or {}).get("plateAppearances"))
     avg = _format_slash_value((stat or {}).get("avg"))
@@ -364,6 +378,56 @@ def _option_hitter_secondary(stat: dict, woba=None, xwoba=None):
     return " | ".join(parts) if parts else None
 
 
+def _option_pitcher_has_advanced_sample(stat: dict) -> bool:
+    outs = infra._safe_int((stat or {}).get("outs"))
+    if outs is not None:
+        return outs >= OPTION_PITCHER_MIN_OUTS
+    ip = infra._safe_float((stat or {}).get("inningsPitched")) or 0.0
+    return ip >= 10.0
+
+
+def _option_pitcher_primary(prefix: str, stat: dict, usage=None):
+    ip = _format_ip((stat or {}).get("inningsPitched"))
+    era = infra._safe_float((stat or {}).get("era"))
+    parts = []
+    usage_text = _option_pitcher_usage_text(usage)
+    if usage_text:
+        parts.append(usage_text)
+    if ip is not None:
+        parts.append(f"{ip} IP")
+    if era is not None:
+        parts.append(f"{era:.2f} ERA")
+    if not parts:
+        fallback = format_stat_clause(stat, pitcher=True)
+        return f"{prefix}: {fallback}" if fallback else None
+    return f"{prefix}: {', '.join(parts)}"
+
+
+def _option_pitcher_secondary(stat: dict, saber=None):
+    if not _option_pitcher_has_advanced_sample(stat):
+        return None
+
+    parts = []
+    saber = saber or {}
+    fip = infra._safe_float(saber.get("fip"))
+    xfip = infra._safe_float(saber.get("xfip"))
+    if fip is not None and xfip is not None:
+        parts.append(f"{fip:.2f} FIP / {xfip:.2f} xFIP")
+    elif fip is not None:
+        parts.append(f"{fip:.2f} FIP")
+    elif xfip is not None:
+        parts.append(f"{xfip:.2f} xFIP")
+
+    batters_faced = infra._safe_int((stat or {}).get("battersFaced")) or 0
+    strikeouts = infra._safe_int((stat or {}).get("strikeOuts"))
+    walks = infra._safe_int((stat or {}).get("baseOnBalls"))
+    if batters_faced and strikeouts is not None:
+        parts.append(f"{int(round(100 * strikeouts / batters_faced))} K%")
+    if batters_faced and walks is not None:
+        parts.append(f"{int(round(100 * walks / batters_faced))} BB%")
+    return " | ".join(parts) if parts else None
+
+
 def build_option_hitter_post(base_text: str, player_link: str, prefix: str,
                              selected: dict, usage=None, woba=None, xwoba=None,
                              max_len=infra.MAX_POST_LEN):
@@ -399,6 +463,43 @@ def build_option_hitter_post(base_text: str, player_link: str, prefix: str,
         player_link,
         _labeled_stats(selected, prefix, pitcher=False),
         pitcher=False,
+        max_len=max_len,
+    )
+
+
+def build_option_pitcher_post(base_text: str, player_link: str, prefix: str,
+                              selected: dict, usage=None, saber=None,
+                              max_len=infra.MAX_POST_LEN):
+    """Render an optioned pitcher as usage/results plus rate-stat context."""
+    stat = (selected or {}).get("splitStats") or {}
+    full_primary = _option_pitcher_primary(prefix, stat, usage=usage)
+    compact_primary = _option_pitcher_primary(prefix, stat, usage=None)
+    secondary = _option_pitcher_secondary(stat, saber=saber)
+
+    def render(primary, detail=None):
+        lines = [base_text]
+        if primary:
+            lines.append(primary)
+        if detail:
+            lines.append(detail)
+        lines.append(player_link)
+        return "\n".join(lines)
+
+    attempts = [
+        render(full_primary, secondary),
+        render(compact_primary, secondary),
+        render(full_primary),
+        render(compact_primary),
+    ]
+    for post in attempts:
+        if len(post) <= max_len:
+            return post
+
+    return build_post_with_optional_stats(
+        base_text,
+        player_link,
+        _labeled_stats(selected, prefix, pitcher=True),
+        pitcher=True,
         max_len=max_len,
     )
 
@@ -450,6 +551,21 @@ def build_special_transaction_post(tx: dict, category: str, cache: dict, now_la)
                     usage=usage, woba=woba, xwoba=xwoba,
                     max_len=infra.MAX_POST_LEN,
                 )
+            if selected and pitcher:
+                usage, _usage_ok = statcast.fetch_mlb_usage(
+                    person_id, True, season, start, tx_date, cache=cache
+                )
+                saber = None
+                if _option_pitcher_has_advanced_sample(selected.get("splitStats") or {}):
+                    saber, _saber_ok = pitching.fetch_pitcher_sabermetrics(
+                        person_id, season, start, tx_date,
+                        cache=cache, team_id=infra.TEAM_ID,
+                    )
+                return build_option_pitcher_post(
+                    base_text, link, prefix, selected,
+                    usage=usage, saber=saber,
+                    max_len=infra.MAX_POST_LEN,
+                )
             stats_line = _labeled_stats(selected, prefix, pitcher)
             if not stats_line and ok:
                 stats_line = f"{prefix}: did not appear"
@@ -474,6 +590,21 @@ def build_special_transaction_post(tx: dict, category: str, cache: dict, now_la)
                 return build_option_hitter_post(
                     base_text, link, prefix, selected,
                     usage=usage, woba=woba, xwoba=xwoba,
+                    max_len=infra.MAX_POST_LEN,
+                )
+            if selected and pitcher:
+                usage, _usage_ok = statcast.fetch_mlb_usage(
+                    person_id, True, season, season_start, tx_date, cache=cache
+                )
+                saber = None
+                if _option_pitcher_has_advanced_sample(selected.get("splitStats") or {}):
+                    saber, _saber_ok = pitching.fetch_pitcher_sabermetrics(
+                        person_id, season, season_start, tx_date,
+                        cache=cache, team_id=infra.TEAM_ID,
+                    )
+                return build_option_pitcher_post(
+                    base_text, link, prefix, selected,
+                    usage=usage, saber=saber,
                     max_len=infra.MAX_POST_LEN,
                 )
             stats_line = _labeled_stats(selected, prefix, pitcher)
