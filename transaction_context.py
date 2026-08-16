@@ -7,6 +7,7 @@ underlying transaction text, ordering, or stat enrichment.
 
 from datetime import date
 
+import acquisition_intelligence as acquisition
 import bot_core as infra
 import mlb_domain as domain
 import roster_intelligence as roster
@@ -185,16 +186,43 @@ def _il_parts(history, current_tx):
     return parts
 
 
+def _is_incoming_claim(tx: dict) -> bool:
+    return (
+        domain.is_claimed_off_waivers_transaction(tx)
+        and infra._safe_int(infra._get_in(tx, "toTeam", "id")) == infra.TEAM_ID
+    )
+
+
+def _is_professional_acquisition(tx: dict) -> bool:
+    code = (tx.get("typeCode") or "").strip().upper()
+    if _is_incoming_claim(tx) or domain.is_acquired_transaction(tx):
+        return True
+    if domain.is_signing_transaction(tx) and code != "SGN":
+        return True
+    return False
+
+
+def _acquisition_part(person_id: int, details: dict, tx: dict, cache) -> str | None:
+    if not _is_professional_acquisition(tx):
+        return None
+    tx_date = infra.txn_date_obj(tx)
+    if not tx_date:
+        return None
+    return acquisition.best_acquisition_part(
+        person_id,
+        infra.is_pitcher(details),
+        tx_date.year,
+        cache=cache,
+    )
+
+
 def _forty_man_parts(tx: dict, cache) -> list[str]:
     action = None
     if domain.is_dfa_transaction(tx) or roster.is_d60_create_transaction(tx):
         action = "Opens a 40-man spot"
     elif domain.is_contract_selected_transaction(tx):
         action = "Uses a 40-man spot"
-    elif (
-        domain.is_claimed_off_waivers_transaction(tx)
-        and infra._safe_int(infra._get_in(tx, "toTeam", "id")) == infra.TEAM_ID
-    ):
+    elif _is_incoming_claim(tx):
         action = "Uses a 40-man spot"
     elif roster.is_d60_return_transaction(tx):
         action = "Uses a 40-man spot"
@@ -238,10 +266,7 @@ def context_parts_for_transaction(tx: dict, cache=None, now_la=None) -> list[str
         if part:
             parts.append(part)
 
-    if (
-        domain.is_claimed_off_waivers_transaction(tx)
-        and infra._safe_int(infra._get_in(tx, "toTeam", "id")) == infra.TEAM_ID
-    ):
+    if _is_incoming_claim(tx):
         part = _waiver_part(history, tx)
         if part:
             parts.append(part)
@@ -252,6 +277,15 @@ def context_parts_for_transaction(tx: dict, cache=None, now_la=None) -> list[str
             parts.append(part)
 
     parts.extend(_il_parts(history, tx))
+
+    # Professional acquisitions get at most one player-identity nugget.  It is
+    # deliberately ahead of the generic 40-man count in the fit priority.
+    if _is_professional_acquisition(tx):
+        details = details or domain.fetch_player_details(person_id, cache=cache)
+        part = _acquisition_part(person_id, details, tx, cache)
+        if part:
+            parts.append(part)
+
     parts.extend(_forty_man_parts(tx, cache))
     return parts
 
@@ -265,8 +299,8 @@ def _insert_context(post: str, parts: list[str], max_len: int) -> str:
         insert_at = len(lines) - 1
 
     # Drop lower-priority tail pieces until the context fits.  The first piece
-    # is always the transaction-specific insight (first call-up, option count,
-    # IL duration, etc.); 40-man count is deliberately easiest to drop.
+    # is always the transaction-specific insight; 40-man count is deliberately
+    # easiest to drop.
     candidates = list(parts)
     while candidates:
         context = " | ".join(candidates)
