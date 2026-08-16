@@ -43,7 +43,7 @@ jobs:
           current, additions, current_ok = roster_daily.current_adjusted_count(137, today, windows, cache)
           print('CURRENT_ADJUSTED', current, 'OK', current_ok, 'ADDITIONS', additions)
           assert current == 40, (current, additions)
-          assert any((a.get('person_id') == 700280) for a in additions), additions
+          assert {a.get('person_id') for a in additions} == {700280}, additions
 
           counts, reconciliations, hist_ok = roster_daily.calculate_open_day_history(137, today, cache=cache)
           print('HISTORY_OK', hist_ok, 'DAYS', len(counts))
@@ -56,6 +56,8 @@ jobs:
           assert hist_ok
           assert summary['count'] == 40
           assert summary['open'] is False
+          assert counts[date(2026, 8, 9)] < 40, counts[date(2026, 8, 9)]
+          assert counts[date(2026, 8, 10)] == 40, counts[date(2026, 8, 10)]
 
           data = infra.request_json_with_retry(
               'https://statsapi.mlb.com/api/v1/transactions?teamId=137&startDate=2026-08-10&endDate=2026-08-16'
@@ -89,4 +91,6 @@ jobs:
                   print('LEN', len(p))
                   print(p)
                   assert len(p) <= 300
+                  for impossible in ('41/40', '42/40', '43/40'):
+                      assert impossible not in p, p
           PY
