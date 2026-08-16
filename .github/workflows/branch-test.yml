@@ -1,0 +1,122 @@
+name: Branch enrichment tests
+
+on:
+  push:
+    branches:
+      - agent/enrichment-formatting-v1
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile
+        run: python -m py_compile bot.py bot_core.py
+      - name: Enrichment checks
+        run: |
+          python - <<'PY'
+          from datetime import date, datetime
+          import bot
+          import bot_core as core
+
+          # Standard baseball formatting.
+          hitter = bot.format_stat_clause({
+              "plateAppearances": 87,
+              "avg": ".286",
+              "obp": ".356",
+              "slg": ".471",
+              "homeRuns": 4,
+              "strikeoutPercentage": 22.1,
+              "baseOnBallsPercentage": 9.2,
+          }, pitcher=False)
+          assert hitter == "87 PA, .286/.356/.471, 4 HR, 22% K, 9% BB", hitter
+
+          pitcher = bot.format_stat_clause({
+              "inningsPitched": "31.2",
+              "hits": 27,
+              "era": "3.41",
+              "strikeOuts": 38,
+              "baseOnBalls": 9,
+          }, pitcher=True)
+          assert pitcher == "31.2 IP, 27 H, 3.41 ERA, 38 K, 9 BB", pitcher
+
+          # Contract selections must not take the signing/bio path.
+          assert not bot.is_signing_transaction({
+              "typeCode": "SC",
+              "description": "San Francisco Giants selected the contract of C Test Player",
+          })
+
+          # A current-season AAA line should beat an older meaningful MLB line.
+          core.today_pacific_date = lambda: date(2026, 8, 16)
+          stats_blocks = [{
+              "group": {"displayName": "hitting"},
+              "splits": [
+                  {
+                      "season": "2025",
+                      "sport": {"name": "Major League Baseball"},
+                      "stat": {
+                          "plateAppearances": 88,
+                          "avg": ".221", "obp": ".299", "slg": ".299",
+                          "homeRuns": 1, "strikeoutPercentage": 11.4,
+                          "baseOnBallsPercentage": 8.0,
+                      },
+                  },
+                  {
+                      "season": "2026",
+                      "sport": {"name": "Triple-A"},
+                      "team": {"name": "Worcester Red Sox"},
+                      "stat": {
+                          "plateAppearances": 79,
+                          "avg": ".292", "obp": ".418", "slg": ".492",
+                          "homeRuns": 2, "strikeoutPercentage": 13.9,
+                          "baseOnBallsPercentage": 16.5,
+                      },
+                  },
+              ],
+          }]
+          signing = bot.build_signing_enrichment({
+              "birthDate": "1995-02-03",
+              "primaryPosition": {"code": "2", "abbreviation": "C", "name": "Catcher"},
+          }, stats_blocks=stats_blocks)
+          assert signing["primary_label_short"] == "2026 AAA", signing
+          assert signing["primary_stats"].startswith("79 PA, .292/.418/.492"), signing
+
+          # Selected for one day and optioned without appearing should say so.
+          original_details = core.get_player_details
+          original_range = core.get_player_by_date_range
+          original_season = core.get_player_season_stats
+          try:
+              core.get_player_details = lambda pid, cache: {
+                  "primaryPosition": {"code": "2", "abbreviation": "C", "name": "Catcher"},
+                  "transactions": [{
+                      "id": 10,
+                      "effectiveDate": "2026-08-10",
+                      "typeCode": "SC",
+                      "description": "San Francisco Giants selected the contract of C Zach Morgan",
+                  }],
+              }
+              core.get_player_by_date_range = lambda *args, **kwargs: {"stats": []}
+              core.get_player_season_stats = lambda *args, **kwargs: {"stats": []}
+              post = bot.build_special_transaction_post({
+                  "id": 11,
+                  "effectiveDate": "2026-08-11",
+                  "typeCode": "OPT",
+                  "description": "San Francisco Giants optioned C Zach Morgan to Sacramento River Cats",
+                  "person": {"id": 681439},
+              }, "optioned", {}, datetime(2026, 8, 11))
+              assert "MLB since Aug 10: did not appear" in post, post
+          finally:
+              core.get_player_details = original_details
+              core.get_player_by_date_range = original_range
+              core.get_player_season_stats = original_season
+
+          print("branch enrichment checks passed")
+          PY
