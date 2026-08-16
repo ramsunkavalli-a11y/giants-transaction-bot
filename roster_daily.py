@@ -1,7 +1,7 @@
 """Nightly Giants 40-man open-spot streak post.
 
 This runs separately from the transaction poller near the end of the Los
-Angeles calendar day.  A same-day create-and-fill does not count as an open
+Angeles calendar day. A same-day create-and-fill does not count as an open
 roster day; the goal is to measure days the club actually finishes with unused
 40-man capacity.
 """
@@ -43,7 +43,7 @@ def is_due_time(now_la) -> bool:
 def _is_40man_add(tx: dict, team_id: int) -> bool:
     if domain.is_contract_selected_transaction(tx):
         return True
-    if roster.is_d60_return_transaction(tx):
+    if roster.is_mlb_team_d60_return_transaction(tx, team_id=team_id):
         return True
     if (
         domain.is_claimed_off_waivers_transaction(tx)
@@ -62,7 +62,8 @@ def normalize_isolated_transaction_dips(counts: dict, transactions: list[dict],
     """Repair rare historical snapshots taken between same-day 40-man moves.
 
     Conservative rule: only an isolated sub-40 day surrounded by full days,
-    with an explicit same-day 60-day-IL spot creation and a 40-man addition.
+    with an explicit MLB-club 60-day-IL spot creation and a 40-man addition.
+    Affiliate 60-day IL moves never qualify.
     """
     fixed = dict(counts)
     ordered = sorted(fixed)
@@ -82,7 +83,10 @@ def normalize_isolated_transaction_dips(counts: dict, transactions: list[dict],
             continue
         txs = by_date.get(d, [])
         if (
-            any(roster.is_d60_create_transaction(tx) for tx in txs)
+            any(
+                roster.is_mlb_team_d60_create_transaction(tx, team_id=team_id)
+                for tx in txs
+            )
             and any(_is_40man_add(tx, team_id) for tx in txs)
         ):
             fixed[d] = 40
