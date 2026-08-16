@@ -1,0 +1,47 @@
+name: Transaction presentation probe
+
+on:
+  push:
+    branches:
+      - agent/enrichment-formatting-v1
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Inspect grouped-code shapes
+        run: |
+          python - <<'PY'
+          import json
+          import bot_core as infra
+
+          data = infra.request_json_with_retry(
+              "https://statsapi.mlb.com/api/v1/transactions"
+              "?teamId=137&startDate=2026-02-21&endDate=2026-08-16"
+          )
+          txns = data.get("transactions") or []
+
+          print("ASG AFTER CUTOFF")
+          for tx in txns:
+              if (tx.get("typeCode") or "").upper() == "ASG":
+                  print(tx.get("date"), tx.get("description"))
+
+          print("\nCLW SHAPES")
+          for tx in txns:
+              if (tx.get("typeCode") or "").upper() == "CLW":
+                  print(json.dumps(tx, sort_keys=True))
+
+          print("\nOUT/REL SHAPES")
+          for tx in txns:
+              if (tx.get("typeCode") or "").upper() in {"OUT", "REL"}:
+                  keep = {k: tx.get(k) for k in ("id", "date", "typeCode", "typeDesc", "description", "person", "fromTeam", "toTeam") if tx.get(k) is not None}
+                  print(json.dumps(keep, sort_keys=True))
+          PY
