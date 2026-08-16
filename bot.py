@@ -183,9 +183,10 @@ def _selected_stats_labels(selected: dict):
         return None, None
     season = selected.get("seasonYear")
     level = core._clean_text(selected.get("levelToken"))
-    team = core._clean_text(selected.get("orgName"))
+    # Keep signing labels simple. A player may have played for multiple clubs at
+    # the same level in a season, so naming one team can be misleading.
     base = " ".join(str(x) for x in (season, level) if x) or "Stats"
-    return (f"{base} ({team})" if team else base), base
+    return base, base
 
 
 def _age_years(birth_date_str: str):
@@ -203,23 +204,36 @@ def _age_years(birth_date_str: str):
 def build_signing_enrichment(person: dict, stats_blocks=None):
     pitcher = core.is_pitcher(person)
     blocks = stats_blocks if stats_blocks is not None else (person.get("stats") or [])
+    current_year = core.today_pacific_date().year
 
-    # Compare the most recent MLB and MiLB samples even when they are from
-    # different seasons. Meaningful MLB time wins; otherwise MiLB is the main
-    # line and the tiny MLB sample is still disclosed as PA/IP.
-    mlb = select_mlb_appeared(blocks, pitcher=pitcher)
-    milb = select_highest_milb_appeared(blocks, pitcher=pitcher)
+    # Relevance order for a signing:
+    # 1) meaningful MLB work this season
+    # 2) this season's highest MiLB level (with tiny MLB exposure disclosed)
+    # 3) if there is no current-season MiLB work, fall back to the latest
+    #    meaningful MLB sample, then the latest MiLB/MLB sample.
+    current_mlb = select_mlb_appeared(blocks, pitcher=pitcher, season=current_year)
+    current_milb = select_highest_milb_appeared(blocks, pitcher=pitcher, season=current_year)
+    latest_mlb = select_mlb_appeared(blocks, pitcher=pitcher)
+    latest_milb = select_highest_milb_appeared(blocks, pitcher=pitcher)
 
     primary = None
     secondary = None
-    if mlb and _meaningful_mlb_sample(mlb.get("splitStats") or {}, pitcher):
-        primary = mlb
-    elif milb:
-        primary = milb
-        if mlb:
-            secondary = _sample_only_clause(mlb.get("splitStats") or {}, pitcher)
-    elif mlb:
-        primary = mlb
+    if current_mlb and _meaningful_mlb_sample(current_mlb.get("splitStats") or {}, pitcher):
+        primary = current_mlb
+    elif current_milb:
+        primary = current_milb
+        if current_mlb:
+            secondary = _sample_only_clause(current_mlb.get("splitStats") or {}, pitcher)
+    elif current_mlb:
+        primary = current_mlb
+    elif latest_mlb and _meaningful_mlb_sample(latest_mlb.get("splitStats") or {}, pitcher):
+        primary = latest_mlb
+    elif latest_milb:
+        primary = latest_milb
+        if latest_mlb:
+            secondary = _sample_only_clause(latest_mlb.get("splitStats") or {}, pitcher)
+    elif latest_mlb:
+        primary = latest_mlb
 
     primary_stats = format_stat_clause((primary or {}).get("splitStats") or {}, pitcher) if primary else None
     label_full, label_short = _selected_stats_labels(primary)
@@ -377,6 +391,10 @@ def build_special_transaction_post(tx: dict, category: str, player_cache: dict, 
             payload = core.get_player_by_date_range(pid, season_year, start.isoformat(), tx_date.isoformat(), player_cache)
             sel = select_mlb_appeared(payload.get("stats") or [], pitcher)
             stats_line = _labeled_stats(sel, f"MLB since {_short_date_label(start)}", pitcher)
+            # A successful hydrated response with an explicit empty stats list means
+            # the player was on the MLB roster for the stint but never appeared.
+            if not stats_line and payload and "stats" in payload:
+                stats_line = f"MLB since {_short_date_label(start)}: did not appear"
         if not stats_line:
             payload = core.get_player_season_stats(pid, season_year, player_cache)
             sel = select_mlb_appeared(payload.get("stats") or [], pitcher, season=season_year)
