@@ -1,4 +1,4 @@
-name: Transaction semantic probe
+name: Transaction semantic cleanup
 
 on:
   push:
@@ -6,49 +6,51 @@ on:
       - agent/enrichment-formatting-v1
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  probe:
+  patch:
+    if: github.event.head_commit.message == 'Apply transaction semantic cleanup'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -r requirements.txt
-      - name: Probe remaining transaction codes
+      - name: Apply verified semantics
         run: |
           python - <<'PY'
-          from collections import Counter, defaultdict
-          import bot_core as infra
+          from pathlib import Path
 
-          catalog = infra.request_json_with_retry("https://statsapi.mlb.com/api/v1/transactionTypes")
-          catalog_by_code = {
-              str(item.get("code") or item.get("typeCode") or "").upper(): item
-              for item in catalog
-          }
-          wanted = {"ACQ", "ASG", "NUM", "SGN", "TR", "DES", "DFA", "CLW", "OUT", "RE", "REL"}
-          print("CATALOG")
-          for code in sorted(wanted):
-              print(code, catalog_by_code.get(code))
-
-          data = infra.request_json_with_retry(
-              "https://statsapi.mlb.com/api/v1/transactions"
-              "?teamId=137&startDate=2026-01-01&endDate=2026-08-16"
+          domain_path = Path('mlb_domain.py')
+          text = domain_path.read_text()
+          text = text.replace(
+              '# SC is generic "Status Change" (IL/roster moves), not a signing.\n    if tc in {"SFA", "SMC", "S", "FA"}:',
+              '# SC is generic "Status Change" (IL/roster moves), not a signing.\n    # SGN is MLB\'s generic Signed stream (used by 2026 draft signings).\n    if tc in {"SFA", "SGN", "SMC", "S", "FA"}:'
           )
-          txns = data.get("transactions") or []
-          counts = Counter((tx.get("typeCode") or "").upper() for tx in txns)
-          print("\nCOUNTS", dict(sorted(counts.items())))
+          old_dfa = '''def is_dfa_transaction(tx: dict) -> bool:\n    tc = (tx.get("typeCode") or "").strip().upper()\n    hay = _hay(tx)\n    # DES is the code observed on real 2026 DFA transactions.\n    return tc in {"DES", "DFA"} or (\n        "designated" in hay and "for assignment" in hay\n    )\n'''
+          new_dfa = '''def is_dfa_transaction(tx: dict) -> bool:\n    tc = (tx.get("typeCode") or "").strip().upper()\n    hay = _hay(tx)\n    # Official StatsAPI: DES = Designated for Assignment. DFA instead means\n    # Declared Free Agency and must never be interpreted as a designation.\n    return tc == "DES" or (\n        "designated" in hay and "for assignment" in hay\n    )\n\n\ndef is_declared_free_agency_transaction(tx: dict) -> bool:\n    tc = (tx.get("typeCode") or "").strip().upper()\n    return tc == "DFA" or "declared free agency" in _hay(tx)\n\n\ndef is_claimed_off_waivers_transaction(tx: dict) -> bool:\n    tc = (tx.get("typeCode") or "").strip().upper()\n    hay = _hay(tx)\n    return tc == "CLW" or ("claimed" in hay and "off waivers" in hay)\n\n\ndef is_outrighted_transaction(tx: dict) -> bool:\n    tc = (tx.get("typeCode") or "").strip().upper()\n    return tc == "OUT" or "outright" in _hay(tx)\n\n\ndef is_released_transaction(tx: dict) -> bool:\n    tc = (tx.get("typeCode") or "").strip().upper()\n    return tc == "REL" or "released" in _hay(tx)\n\n\ndef is_reinstated_transaction(tx: dict) -> bool:\n    tc = (tx.get("typeCode") or "").strip().upper()\n    return tc == "RE" or "reinstated" in _hay(tx)\n\n\ndef is_acquired_transaction(tx: dict) -> bool:\n    tc = (tx.get("typeCode") or "").strip().upper()\n    hay = _hay(tx)\n    return tc == "ACQ" or ("acquired" in hay and "traded" not in hay)\n\n\ndef is_trade_transaction(tx: dict) -> bool:\n    tc = (tx.get("typeCode") or "").strip().upper()\n    return tc == "TR" or "traded" in _hay(tx)\n\n\ndef is_number_change_transaction(tx: dict) -> bool:\n    tc = (tx.get("typeCode") or "").strip().upper()\n    return tc == "NUM" or "changed number" in _hay(tx)\n\n\ndef is_assigned_transaction(tx: dict) -> bool:\n    return (tx.get("typeCode") or "").strip().upper() == "ASG"\n'''
+          if old_dfa not in text:
+              raise SystemExit('Expected DFA block not found')
+          text = text.replace(old_dfa, new_dfa)
+          domain_path.write_text(text)
 
-          examples = defaultdict(list)
-          for tx in txns:
-              code = (tx.get("typeCode") or "").upper()
-              if code in wanted and len(examples[code]) < 12:
-                  examples[code].append((tx.get("date"), tx.get("typeDesc"), tx.get("description")))
-          print("\nEXAMPLES")
-          for code in sorted(examples):
-              print("\n--", code)
-              for row in examples[code]:
-                  print(row)
+          test_path = Path('tests/test_domain.py')
+          tests = test_path.read_text()
+          marker = '''    def test_offseason_only_signings_are_special(self):\n'''
+          insertion = '''    def test_declared_free_agency_is_not_designated_for_assignment(self):\n        tx = {\n            "typeCode": "DFA",\n            "typeDesc": "Declared Free Agency",\n            "description": "RHP Test Player declared free agency.",\n        }\n        self.assertTrue(domain.is_declared_free_agency_transaction(tx))\n        self.assertFalse(domain.is_dfa_transaction(tx))\n        self.assertIsNone(domain.classify_transaction(tx, True))\n\n    def test_verified_auxiliary_transaction_codes_do_not_change_routing_yet(self):\n        cases = [\n            (domain.is_claimed_off_waivers_transaction, "CLW", "Claimed Off Waivers", "San Francisco Giants claimed RHP Test Player off waivers from Club."),\n            (domain.is_outrighted_transaction, "OUT", "Outrighted", "San Francisco Giants sent RHP Test Player outright to Sacramento River Cats."),\n            (domain.is_released_transaction, "REL", "Released", "San Francisco Giants released RHP Test Player."),\n            (domain.is_reinstated_transaction, "RE", "Reinstated", "San Francisco Giants reinstated RHP Test Player."),\n            (domain.is_acquired_transaction, "ACQ", "Acquired", "San Francisco Giants acquired RHP Test Player from an independent club."),\n            (domain.is_trade_transaction, "TR", "Trade", "San Francisco Giants traded RHP Test Player to Other Club for cash."),\n            (domain.is_number_change_transaction, "NUM", "Number Change", "RHP Test Player changed number to 42."),\n            (domain.is_assigned_transaction, "ASG", "Assigned", "RHP Test Player assigned to San Francisco Giants."),\n        ]\n        for predicate, code, desc, description in cases:\n            with self.subTest(code=code):\n                tx = {"typeCode": code, "typeDesc": desc, "description": description}\n                self.assertTrue(predicate(tx))\n                self.assertIsNone(domain.classify_transaction(tx, True))\n\n    def test_sgn_signed_stream_is_an_explicit_signing(self):\n        tx = {\n            "typeCode": "SGN",\n            "typeDesc": "Signed",\n            "description": "San Francisco Giants signed OF Test Draft Pick.",\n        }\n        self.assertTrue(domain.is_signing_transaction(tx))\n        self.assertEqual(domain.classify_transaction(tx, True), "signing")\n\n'''
+          if marker not in tests:
+              raise SystemExit('Expected test insertion point not found')
+          tests = tests.replace(marker, insertion + marker, 1)
+          test_path.write_text(tests)
           PY
+      - name: Commit semantics cleanup
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add mlb_domain.py tests/test_domain.py
+          git diff --cached --check
+          git commit -m "Normalize official MLB transaction codes"
+          git push origin HEAD:agent/enrichment-formatting-v1
