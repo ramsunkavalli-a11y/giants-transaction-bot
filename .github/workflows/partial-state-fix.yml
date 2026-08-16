@@ -49,14 +49,6 @@ jobs:
           bot = bot.replace(old, new, 1)
           bot_path.write_text(bot)
 
-          workflow_path = Path('.github/workflows/run.yml')
-          workflow = workflow_path.read_text()
-          old = '      - name: Commit bot state (last_id.txt + seen_ids.txt)\n        run: |\n'
-          new = '      - name: Commit bot state (last_id.txt + seen_ids.txt)\n        if: always()\n        run: |\n'
-          if old not in workflow:
-              raise SystemExit('state commit step not found')
-          workflow_path.write_text(workflow.replace(old, new, 1))
-
           test_path = Path('tests/test_partial_state.py')
           test_path.write_text(
               'import unittest\n'
@@ -101,7 +93,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add bot_core.py bot.py .github/workflows/run.yml tests/test_partial_state.py
+          git add bot_core.py bot.py tests/test_partial_state.py
           git diff --cached --check
           python -m py_compile bot_core.py bot.py tests/test_partial_state.py
           python -m unittest tests.test_partial_state -v
