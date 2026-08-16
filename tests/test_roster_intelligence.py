@@ -54,7 +54,7 @@ class RosterIntelligenceTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIsNone(state)
 
-    def test_anchored_player_60day_il_restores_40man_state(self):
+    def test_d60_after_anchor_makes_trade_inference_unknown(self):
         selected = {
             "id": 20, "date": "2025-11-18", "typeCode": "SE",
             "description": "San Diego Padres selected the contract of RHP Test Player.",
@@ -75,7 +75,21 @@ class RosterIntelligenceTests(unittest.TestCase):
                 998, date(2026, 8, 3), cache={}
             )
         self.assertTrue(ok)
-        self.assertIs(state, True)
+        self.assertIsNone(state)
+
+    def test_mlb_team_level_d60_rejects_affiliate_move(self):
+        affiliate = {
+            "id": 30, "date": "2026-07-01", "typeCode": "SC",
+            "description": "Sacramento River Cats transferred RHP Test Player to the 60-day injured list.",
+            "person": {"id": 997},
+        }
+        major = {
+            "id": 31, "date": "2026-07-01", "typeCode": "SC",
+            "description": "San Francisco Giants transferred RHP Test Player to the 60-day injured list.",
+            "person": {"id": 997},
+        }
+        self.assertFalse(roster.is_mlb_team_d60_create_transaction(affiliate))
+        self.assertTrue(roster.is_mlb_team_d60_create_transaction(major))
 
     def test_recent_incoming_trade_creates_reconciliation_window(self):
         trade = {
