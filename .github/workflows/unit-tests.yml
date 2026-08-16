@@ -1,0 +1,23 @@
+name: Unit tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile
+        run: python -m py_compile bot.py bot_core.py mlb_domain.py pitching_domain.py post_builder.py statcast_domain.py
+      - name: Run offline regression tests
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
