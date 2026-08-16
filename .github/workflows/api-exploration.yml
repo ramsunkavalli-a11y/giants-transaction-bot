@@ -17,9 +17,11 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - name: Probe MLB StatsAPI stat types
+      - name: Probe MLB and Savant data shapes
         run: |
           python - <<'PY'
+          import csv
+          import io
           import json
           import requests
 
@@ -35,7 +37,7 @@ jobs:
               try:
                   data = r.json()
               except Exception:
-                  print(r.text[:2000])
+                  print(r.text[:3000])
                   return
               blocks = data.get("stats") or []
               print("blocks", len(blocks))
@@ -43,7 +45,7 @@ jobs:
                   print(" block", bi, "type=", (block.get("type") or {}).get("displayName"),
                         "group=", (block.get("group") or {}).get("displayName"),
                         "splits=", len(block.get("splits") or []))
-                  for si, split in enumerate((block.get("splits") or [])[:3]):
+                  for si, split in enumerate((block.get("splits") or [])[:5]):
                       stat = split.get("stat") or {}
                       print("  split", si,
                             "season=", split.get("season"),
@@ -52,39 +54,78 @@ jobs:
                             "team=", (split.get("team") or {}).get("name"),
                             "sport=", (split.get("sport") or {}).get("id"))
                       print("   keys", sorted(stat.keys()))
-                      print("   stat", json.dumps(stat, sort_keys=True)[:3500])
+                      print("   stat", json.dumps(stat, sort_keys=True)[:4500])
 
-          common_hit = dict(group="hitting", sportId=1, season=2026)
-          bounded_hit = dict(common_hit, startDate="2026-07-10", endDate="2026-08-14")
-          common_pitch = dict(group="pitching", sportId=1, season=2026)
-          bounded_pitch = dict(common_pitch, startDate="2026-08-07", endDate="2026-08-16")
+          hit_bounds = dict(group="hitting", sportId=1, season=2026,
+                            startDate="2026-07-10", endDate="2026-08-14")
+          field_bounds = dict(group="fielding", sportId=1, season=2026,
+                              startDate="2026-07-10", endDate="2026-08-14")
 
-          # Grant McCray: hitter with a known July 10-Aug 14 MLB stint.
-          for stat_type in [
-              "expectedStatistics", "byDateRangeAdvanced", "gameLog", "tracking",
-              "sabermetrics", "outsAboveAverage", "projected_ZipsRos", "availableStats",
+          # Usage / lineup information.
+          for stat_type, params in [
+              ("atGameStart", hit_bounds),
+              ("lastXGames", dict(group="hitting", sportId=1, season=2026, limit=10)),
+              ("playLog", hit_bounds),
+              ("gameLog", field_bounds),
           ]:
-              params = dict(bounded_hit)
-              params["stats"] = stat_type
-              probe(f"McCray {stat_type} BOUNDED", 687529, **params)
+              p = dict(params, stats=stat_type)
+              probe(f"McCray {stat_type}", 687529, **p)
 
-          # Compare expected stats with/without date bounds to see whether the endpoint honors them.
-          params = dict(common_hit, stats="expectedStatistics")
-          probe("McCray expectedStatistics FULL SEASON", 687529, **params)
-
-          # Trent Harris: pitcher selected Aug 7; useful for pitcher-side API shape discovery.
-          for stat_type in [
-              "expectedStatistics", "byDateRangeAdvanced", "gameLog", "tracking",
-              "sabermetrics", "pitchArsenal", "metricAverages", "projected_ZipsRos", "availableStats",
+          # Try documented metric names/ids; metricAverages requires an extra selector if usable.
+          for extra in [
+              {"metrics": "launchSpeed,launchAngle"},
+              {"metricIds": "1003,1005"},
+              {"metric": "launchSpeed"},
           ]:
-              params = dict(bounded_pitch)
-              params["stats"] = stat_type
-              probe(f"Harris {stat_type} BOUNDED", 805345, **params)
+              p = dict(hit_bounds, stats="metricAverages", **extra)
+              probe(f"McCray metricAverages {extra}", 687529, **p)
 
-          # Metadata endpoints that may reveal additional useful capabilities.
-          for path in ["statTypes", "metrics", "baseballStats"]:
+          # MiLB advanced/sabermetric availability can improve selection/recall posts too.
+          for player_id, name, group in [
+              (668800, "Knizner AAA", "hitting"),
+              (805345, "Harris AAA", "pitching"),
+          ]:
+              for stat_type in ["byDateRangeAdvanced", "sabermetrics", "expectedStatistics", "gameLog"]:
+                  p = dict(group=group, sportId=11, season=2026,
+                           startDate="2026-01-01", endDate="2026-08-11", stats=stat_type)
+                  probe(f"{name} {stat_type}", player_id, **p)
+
+          # Baseball Savant's MLB-owned CSV endpoint: inspect whether date-bounded expected values
+          # can be derived cleanly without scraping HTML.
+          savant_params = {
+              "all": "true",
+              "type": "batter",
+              "player_type": "batter",
+              "hfSea": "2026|",
+              "game_date_gt": "2026-07-10",
+              "game_date_lt": "2026-08-14",
+              "batter_lookup[]": "687529",
+          }
+          r = requests.get("https://baseballsavant.mlb.com/statcast_search/csv", params=savant_params, timeout=60)
+          print("\n" + "=" * 100)
+          print("SAVANT McCray date-bounded CSV", r.status_code, r.url, "bytes", len(r.content))
+          print(r.text[:1000])
+          if r.ok and r.text.strip():
+              rows = list(csv.DictReader(io.StringIO(r.text)))
+              print("rows", len(rows))
+              if rows:
+                  print("columns", rows[0].keys())
+                  expected = [row for row in rows if row.get("estimated_woba_using_speedangle") not in (None, "")]
+                  denom = [row for row in rows if row.get("woba_denom") not in (None, "", "0")]
+                  print("expected-value rows", len(expected), "woba-denom rows", len(denom))
+                  print("sample expected rows")
+                  for row in expected[:8]:
+                      keep = {k: row.get(k) for k in [
+                          "game_date", "events", "description", "launch_speed", "launch_angle",
+                          "estimated_ba_using_speedangle", "estimated_woba_using_speedangle",
+                          "woba_value", "woba_denom"
+                      ]}
+                      print(json.dumps(keep, sort_keys=True))
+
+          # A few metadata endpoints that may help transaction/roster semantics later.
+          for path in ["transactionTypes", "rosterTypes", "rosterStatuses", "pitchTypes", "eventTypes"]:
               r = requests.get(f"{BASE}/{path}", timeout=30)
               print("\n" + "=" * 100)
               print("METADATA", path, r.status_code, r.url)
-              print(r.text[:12000])
+              print(r.text[:8000])
           PY
