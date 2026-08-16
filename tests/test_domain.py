@@ -202,8 +202,10 @@ class ApiShapeTests(unittest.TestCase):
 
 
 class BuildIsolationTests(unittest.TestCase):
-    def test_runtime_builder_is_not_legacy_core_builder(self):
-        self.assertIsNot(post_builder.build_posts, infra.build_posts)
+    def test_core_contains_no_legacy_domain_builder_or_classifiers(self):
+        self.assertFalse(hasattr(infra, "build_posts"))
+        self.assertFalse(hasattr(infra, "is_signing_transaction"))
+        self.assertFalse(hasattr(infra, "is_contract_selected_transaction"))
 
     def test_hitter_formatter_derives_missing_rates_from_pa(self):
         text = post_builder.format_stat_clause({
