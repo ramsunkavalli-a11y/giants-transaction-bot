@@ -111,7 +111,7 @@ class TransactionContextTests(unittest.TestCase):
             ["Returns after 61 days on IL", "Uses a 40-man spot", "40-man: 40/40"],
         )
 
-    def test_claim_reports_days_since_dfa(self):
+    def test_claim_reports_dfa_acquisition_and_40man_context(self):
         dfa = {
             "id": 100, "date": "2026-08-01", "typeCode": "DES",
             "description": "Seattle Mariners designated 1B Test Player for assignment.",
@@ -124,11 +124,18 @@ class TransactionContextTests(unittest.TestCase):
             "fromTeam": {"id": 136}, "toTeam": {"id": 137},
         }
         with patch.object(context.domain, "fetch_player_transactions", return_value=([dfa, claim], True)), \
+             patch.object(context.domain, "fetch_player_details", return_value={"id": 123, "primaryPosition": {"abbreviation": "1B"}}), \
+             patch.object(context.acquisition, "best_acquisition_part", return_value="ZiPS ROS: 92 wRC+"), \
              patch.object(context.roster, "adjusted_40man_count", return_value=(40, [], True)):
             parts = context.context_parts_for_transaction(claim, cache={})
         self.assertEqual(
             parts,
-            ["Claimed 3 days after DFA", "Uses a 40-man spot", "40-man: 40/40"],
+            [
+                "Claimed 3 days after DFA",
+                "ZiPS ROS: 92 wRC+",
+                "Uses a 40-man spot",
+                "40-man: 40/40",
+            ],
         )
 
     def test_first_career_outright(self):
