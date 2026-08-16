@@ -1,4 +1,4 @@
-name: ASG assignment cleanup
+name: ASG live validation
 
 on:
   push:
@@ -6,57 +6,56 @@ on:
       - agent/enrichment-formatting-v1
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  patch:
-    if: github.event.head_commit.message == 'Apply ASG assignment cleanup'
+  validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - name: Apply ASG cleanup
+      - name: Validate generic suppression and rehab dedupe
         run: |
           python - <<'PY'
-          from pathlib import Path
+          from datetime import datetime
+          import bot_core as infra
+          import post_builder
 
-          domain_path = Path('mlb_domain.py')
-          text = domain_path.read_text()
-          old = '''def is_assigned_transaction(tx: dict) -> bool:\n    return (tx.get("typeCode") or "").strip().upper() == "ASG"\n'''
-          new = '''def is_assigned_transaction(tx: dict) -> bool:\n    return (tx.get("typeCode") or "").strip().upper() == "ASG"\n\n\ndef is_rehab_assignment_transaction(tx: dict) -> bool:\n    return is_assigned_transaction(tx) and "rehab assignment" in _hay(tx)\n\n\ndef is_generic_org_assignment_transaction(\n    tx: dict, team_name: str = "San Francisco Giants"\n) -> bool:\n    """Identify administrative org assignments without hiding rehab news."""\n    if not is_assigned_transaction(tx) or is_rehab_assignment_transaction(tx):\n        return False\n    team = str(team_name or "").strip().lower()\n    return bool(team) and f"assigned to {team}" in _hay(tx)\n'''
-          if old not in text:
-              raise SystemExit('ASG helper insertion point not found')
-          domain_path.write_text(text.replace(old, new, 1))
+          data = infra.request_json_with_retry(
+              "https://statsapi.mlb.com/api/v1/transactions"
+              "?teamId=137&startDate=2026-03-01&endDate=2026-04-15"
+          )
+          txns = data.get("transactions") or []
 
-          builder_path = Path('post_builder.py')
-          builder = builder_path.read_text()
-          old_init = '''    separate_posts = []\n    grouped = []\n\n    for tx in sorted(new_txns, key=infra.txn_id):\n'''
-          new_init = '''    separate_posts = []\n    grouped = []\n    seen_rehab_assignments = set()\n\n    for tx in sorted(new_txns, key=infra.txn_id):\n'''
-          if old_init not in builder:
-              raise SystemExit('build_posts init not found')
-          builder = builder.replace(old_init, new_init, 1)
+          generic = next(
+              tx for tx in txns
+              if (tx.get("typeCode") or "").upper() == "ASG"
+              and "Jonah Cox assigned to San Francisco Giants" in (tx.get("description") or "")
+          )
+          assert post_builder.build_posts(
+              [generic], player_cache={}, season_mode=True,
+              now_la=datetime(2026, 4, 15, 11, 0, 0),
+          ) == []
+          print("GENERIC SUPPRESSED:", infra.txn_desc(generic))
 
-          old_filter = '''        if domain.is_number_change_transaction(tx):\n            continue\n\n        # Incoming waiver claims benefit from the same date-bounded player\n'''
-          new_filter = '''        if domain.is_number_change_transaction(tx):\n            continue\n\n        # ASG is overloaded by StatsAPI. Plain "assigned to San Francisco\n        # Giants" records are administrative roster-loading noise; rehab\n        # assignments are useful, but the API often emits exact duplicates.\n        if domain.is_generic_org_assignment_transaction(tx):\n            continue\n        if domain.is_rehab_assignment_transaction(tx):\n            rehab_key = (\n                infra.txn_date(tx),\n                infra.txn_desc(tx).strip().lower(),\n            )\n            if rehab_key in seen_rehab_assignments:\n                continue\n            seen_rehab_assignments.add(rehab_key)\n\n        # Incoming waiver claims benefit from the same date-bounded player\n'''
-          if old_filter not in builder:
-              raise SystemExit('presentation filter insertion point not found')
-          builder_path.write_text(builder.replace(old_filter, new_filter, 1))
-
-          test_path = Path('tests/test_asg_filtering.py')
-          test_path.write_text('''import unittest\nfrom datetime import datetime\n\nimport mlb_domain as domain\nimport post_builder\n\n\nclass AssignmentFilteringTests(unittest.TestCase):\n    def test_generic_org_assignment_is_noise_but_rehab_is_not(self):\n        generic = {\n            "id": 1, "date": "2026-03-02", "typeCode": "ASG",\n            "description": "CF Jonah Cox assigned to San Francisco Giants.",\n        }\n        rehab = {\n            "id": 2, "date": "2026-07-29", "typeCode": "ASG",\n            "description": "San Francisco Giants sent CF Jonah Cox on a rehab assignment to Sacramento River Cats.",\n        }\n        self.assertTrue(domain.is_generic_org_assignment_transaction(generic))\n        self.assertFalse(domain.is_rehab_assignment_transaction(generic))\n        self.assertTrue(domain.is_rehab_assignment_transaction(rehab))\n        self.assertFalse(domain.is_generic_org_assignment_transaction(rehab))\n\n    def test_generic_org_assignment_is_suppressed(self):\n        generic = {\n            "id": 1, "date": "2026-03-02", "typeCode": "ASG",\n            "description": "CF Jonah Cox assigned to San Francisco Giants.",\n        }\n        posts = post_builder.build_posts(\n            [generic], season_mode=True, now_la=datetime(2026, 3, 2)\n        )\n        self.assertEqual(posts, [])\n\n    def test_exact_same_day_rehab_duplicates_are_deduped(self):\n        description = "San Francisco Giants sent LHP Sam Hentges on a rehab assignment to Sacramento River Cats."\n        first = {"id": 1, "date": "2026-04-14", "typeCode": "ASG", "description": description}\n        second = {"id": 2, "date": "2026-04-14", "typeCode": "ASG", "description": description}\n        posts = post_builder.build_posts(\n            [first, second], season_mode=True, now_la=datetime(2026, 4, 14)\n        )\n        joined = "\\n".join(posts)\n        self.assertEqual(joined.count(description), 1)\n\n    def test_distinct_rehab_assignments_are_preserved(self):\n        san_jose = {\n            "id": 1, "date": "2026-05-10", "typeCode": "ASG",\n            "description": "San Francisco Giants sent RHP Test Player on a rehab assignment to San Jose Giants.",\n        }\n        sacramento = {\n            "id": 2, "date": "2026-05-12", "typeCode": "ASG",\n            "description": "San Francisco Giants sent RHP Test Player on a rehab assignment to Sacramento River Cats.",\n        }\n        posts = post_builder.build_posts(\n            [san_jose, sacramento], season_mode=True, now_la=datetime(2026, 5, 12)\n        )\n        joined = "\\n".join(posts)\n        self.assertIn("San Jose Giants", joined)\n        self.assertIn("Sacramento River Cats", joined)\n\n\nif __name__ == "__main__":\n    unittest.main()\n''')
+          hentges = [
+              tx for tx in txns
+              if (tx.get("typeCode") or "").upper() == "ASG"
+              and tx.get("date") == "2026-04-14"
+              and "Sam Hentges" in (tx.get("description") or "")
+              and "Sacramento River Cats" in (tx.get("description") or "")
+          ]
+          assert len(hentges) >= 2, len(hentges)
+          posts = post_builder.build_posts(
+              hentges, player_cache={}, season_mode=True,
+              now_la=datetime(2026, 4, 15, 11, 0, 0),
+          )
+          joined = "\n".join(posts)
+          description = "San Francisco Giants sent LHP Sam Hentges on a rehab assignment to Sacramento River Cats."
+          assert joined.count(description) == 1, joined
+          print("\nREHAB DEDUPED\n" + joined)
+          print("\nLIVE ASG VALIDATION PASSED")
           PY
-      - name: Test and commit
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add mlb_domain.py post_builder.py tests/test_asg_filtering.py
-          git diff --cached --check
-          python -m py_compile mlb_domain.py post_builder.py tests/test_asg_filtering.py
-          python -m unittest tests.test_asg_filtering -v
-          git commit -m "Filter noisy assignments and dedupe rehab records"
-          git push origin HEAD:agent/enrichment-formatting-v1
