@@ -270,6 +270,31 @@ def extract_tx_player_id(tx: dict):
     return person_id
 
 
+def transaction_ids_represented_in_post(text: str, txns) -> set[int]:
+    """Return transaction IDs visibly represented by one rendered post.
+
+    Matching requires both the transaction date and description. The short
+    prefix fallback covers the rare grouped line trimmed to the 300-char post
+    limit without confusing same-description moves from different dates.
+    """
+    hay = str(text or "")
+    represented = set()
+    for tx in txns or []:
+        txid = txn_id(tx)
+        if txid <= 0:
+            continue
+        date_text = txn_date(tx)
+        description = txn_desc(tx).strip()
+        if not date_text or date_text not in hay or not description:
+            continue
+        if description in hay:
+            represented.add(txid)
+            continue
+        if len(description) >= 80 and description[:80] in hay:
+            represented.add(txid)
+    return represented
+
+
 def player_url(player_id: int) -> str:
     return f"https://www.mlb.com/player/{player_id}"
 

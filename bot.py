@@ -13,6 +13,18 @@ import bot_core as infra
 import post_builder
 
 
+def record_successful_post(text, new_txns, seen_ids):
+    """Persist represented transaction IDs immediately after Bluesky accepts a post."""
+    covered = infra.transaction_ids_represented_in_post(text, new_txns)
+    if not covered:
+        print("WARNING: posted text could not be mapped to transaction IDs")
+        return set()
+    seen_ids.update(covered)
+    infra.save_seen_ids(seen_ids)
+    print("Persisted posted transaction IDs:", sorted(covered))
+    return covered
+
+
 def main():
     identifier = infra.os.environ["BSKY_IDENTIFIER"]
     app_password = infra.os.environ["BSKY_APP_PASSWORD"]
@@ -95,6 +107,11 @@ def main():
         cid = response.get("cid")
         print("Posted:\n", text, "\n---")
         print("CreateRecord uri:", uri, "cid:", cid)
+
+        # CreateRecord returned successfully, so persist transaction progress
+        # before verification/sleep/a later post can fail. The workflow commits
+        # this state even when a later bot step exits non-zero.
+        record_successful_post(text, new_txns, seen_ids)
 
         status, body_snip = infra.bsky_verify_record(access_jwt, did, uri)
         print("Verify getRecord status:", status)
