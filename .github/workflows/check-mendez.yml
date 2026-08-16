@@ -1,0 +1,46 @@
+name: Temporary Mendez roster check
+
+on:
+  push:
+    branches:
+      - agent/enrichment-formatting-v1
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    if: github.event.head_commit.message == 'Check Miguel Mendez roster state'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - name: Query MLB raw roster state
+        run: |
+          python - <<'PY'
+          import requests, json
+          B='https://statsapi.mlb.com/api/v1'
+          pid=700280
+          for label,url in [
+            ('PERSON', f'{B}/people/{pid}?hydrate=currentTeam'),
+            ('TX', f'{B}/transactions?playerId={pid}&startDate=2026-07-25&endDate=2026-08-16'),
+            ('SF40', f'{B}/teams/137/roster/40Man'),
+            ('SD40', f'{B}/teams/135/roster/40Man'),
+          ]:
+              data=requests.get(url,timeout=30).json()
+              print('\n===',label,'===')
+              if label=='PERSON':
+                  p=(data.get('people') or [{}])[0]
+                  print(json.dumps({k:p.get(k) for k in ['id','fullName','currentTeam','active']},indent=2))
+              elif label=='TX':
+                  for t in data.get('transactions') or []:
+                      print(t.get('id'),t.get('date'),t.get('typeCode'),t.get('description'), 'from=',(t.get('fromTeam') or {}).get('name'),'to=',(t.get('toTeam') or {}).get('name'))
+              else:
+                  hits=[]
+                  for x in data.get('roster') or []:
+                      if (x.get('person') or {}).get('id')==pid:
+                          hits.append({'person':x.get('person'),'status':x.get('status'),'position':x.get('position')})
+                  print('TOTAL',len(data.get('roster') or []),'MENDEZ',json.dumps(hits,indent=2))
+          PY
