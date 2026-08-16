@@ -335,7 +335,7 @@ def _option_hitter_primary(prefix: str, stat: dict, usage=None):
     return f"{prefix}: {', '.join(parts)}"
 
 
-def _option_hitter_secondary(stat: dict, xwoba=None):
+def _option_hitter_secondary(stat: dict, woba=None, xwoba=None):
     pa = infra._safe_int((stat or {}).get("plateAppearances")) or 0
     if pa < OPTION_XWOBA_MIN_PA:
         return None
@@ -343,7 +343,10 @@ def _option_hitter_secondary(stat: dict, xwoba=None):
     parts = []
     if xwoba is not None:
         x_text = _format_slash_value(xwoba)
-        if x_text:
+        w_text = _format_slash_value(woba) if woba is not None else None
+        if x_text and w_text:
+            parts.append(f"{w_text} wOBA / {x_text} xwOBA")
+        elif x_text:
             parts.append(f"{x_text} xwOBA")
 
     strikeouts = infra._safe_int((stat or {}).get("strikeOuts"))
@@ -362,13 +365,13 @@ def _option_hitter_secondary(stat: dict, xwoba=None):
 
 
 def build_option_hitter_post(base_text: str, player_link: str, prefix: str,
-                             selected: dict, usage=None, xwoba=None,
+                             selected: dict, usage=None, woba=None, xwoba=None,
                              max_len=infra.MAX_POST_LEN):
     """Render a demotion as opportunity + familiar results + expected/process."""
     stat = (selected or {}).get("splitStats") or {}
     full_primary = _option_hitter_primary(prefix, stat, usage=usage)
     compact_primary = _option_hitter_primary(prefix, stat, usage=None)
-    secondary = _option_hitter_secondary(stat, xwoba=xwoba)
+    secondary = _option_hitter_secondary(stat, woba=woba, xwoba=xwoba)
 
     def render(primary, detail=None):
         lines = [base_text]
@@ -436,14 +439,15 @@ def build_special_transaction_post(tx: dict, category: str, cache: dict, now_la)
                 )
                 stat = selected.get("splitStats") or {}
                 pa = infra._safe_int(stat.get("plateAppearances")) or 0
+                woba = None
                 xwoba = None
                 if pa >= OPTION_XWOBA_MIN_PA:
-                    xwoba, _actual, _denom, _x_ok = statcast.fetch_date_bounded_xwoba(
+                    xwoba, woba, _denom, _x_ok = statcast.fetch_date_bounded_xwoba(
                         person_id, False, season, start, tx_date, cache=cache
                     )
                 return build_option_hitter_post(
                     base_text, link, prefix, selected,
-                    usage=usage, xwoba=xwoba,
+                    usage=usage, woba=woba, xwoba=xwoba,
                     max_len=infra.MAX_POST_LEN,
                 )
             stats_line = _labeled_stats(selected, prefix, pitcher)
@@ -461,14 +465,15 @@ def build_special_transaction_post(tx: dict, category: str, cache: dict, now_la)
                 )
                 stat = selected.get("splitStats") or {}
                 pa = infra._safe_int(stat.get("plateAppearances")) or 0
+                woba = None
                 xwoba = None
                 if pa >= OPTION_XWOBA_MIN_PA:
-                    xwoba, _actual, _denom, _x_ok = statcast.fetch_date_bounded_xwoba(
+                    xwoba, woba, _denom, _x_ok = statcast.fetch_date_bounded_xwoba(
                         person_id, False, season, season_start, tx_date, cache=cache
                     )
                 return build_option_hitter_post(
                     base_text, link, prefix, selected,
-                    usage=usage, xwoba=xwoba,
+                    usage=usage, woba=woba, xwoba=xwoba,
                     max_len=infra.MAX_POST_LEN,
                 )
             stats_line = _labeled_stats(selected, prefix, pitcher)
