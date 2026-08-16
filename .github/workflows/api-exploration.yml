@@ -17,72 +17,49 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - name: Probe date-bounded xwOBA and usage
+      - name: Probe pitcher date-bounded xwOBA
         run: |
           python - <<'PY'
           import csv
           import io
           import requests
 
-          player_id = 687529
-          start = "2026-07-10"
-          end = "2026-08-14"
+          player_id = 805345
+          start = "2026-08-07"
+          end = "2026-08-16"
 
-          # Usage: game appearances from hitting log, starts from fielding log.
-          def stats(group, stat_type, **extra):
-              params = dict(group=group, sportId=1, season=2026,
-                            startDate=start, endDate=end, stats=stat_type, **extra)
-              r = requests.get(
-                  f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats",
-                  params=params, timeout=30,
-              )
-              r.raise_for_status()
-              return r.json()
-
-          hit_log = stats("hitting", "gameLog")
-          field_log = stats("fielding", "gameLog")
-          hit_splits = (hit_log.get("stats") or [{}])[0].get("splits") or []
-          field_splits = (field_log.get("stats") or [{}])[0].get("splits") or []
-          games = len({(s.get("game") or {}).get("gamePk") for s in hit_splits if (s.get("game") or {}).get("gamePk")})
-          starts = sum(int((s.get("stat") or {}).get("gamesStarted") or 0) for s in field_splits)
-          print("USAGE", games, "G", starts, "GS")
-
-          # Does expectedStatistics honor a single gamePk even though it ignores date bounds?
-          first_game = (hit_splits[0].get("game") or {}).get("gamePk")
-          one_game = stats("hitting", "expectedStatistics", gamePk=first_game)
-          print("EXPECTED gamePk", first_game, one_game)
-
-          # Correct player filter is plural: batters_lookup[].
           params = {
               "all": "true",
-              "type": "batter",
-              "player_type": "batter",
+              "type": "pitcher",
+              "player_type": "pitcher",
               "hfSea": "2026|",
               "game_date_gt": start,
               "game_date_lt": end,
-              "batters_lookup[]": str(player_id),
+              "pitchers_lookup[]": str(player_id),
           }
           r = requests.get(
               "https://baseballsavant.mlb.com/statcast_search/csv",
               params=params, timeout=30,
           )
           r.raise_for_status()
-          print("SAVANT URL", r.url)
-          print("SAVANT bytes", len(r.content))
           rows = list(csv.DictReader(io.StringIO(r.text.lstrip("\ufeff"))))
-          rows = [row for row in rows if str(row.get("batter")) == str(player_id)]
-          print("SAVANT player rows", len(rows))
-
+          rows = [row for row in rows if str(row.get("pitcher")) == str(player_id)]
           pa_rows = [row for row in rows if row.get("woba_denom") not in (None, "", "0")]
-          print("SAVANT PA rows", len(pa_rows))
           actual_num = sum(float(row.get("woba_value") or 0) for row in pa_rows)
           expected_num = sum(float(row.get("estimated_woba_using_speedangle") or 0) for row in pa_rows)
           denom = sum(float(row.get("woba_denom") or 0) for row in pa_rows)
-          print("actual wOBA", round(actual_num / denom, 6) if denom else None)
-          print("expected wOBA", round(expected_num / denom, 6) if denom else None)
-          print("PA denom", denom)
+          print("SAVANT bytes", len(r.content), "pitches", len(rows), "BF denom", denom)
+          print("actual wOBA allowed", round(actual_num / denom, 6) if denom else None)
+          print("xwOBA allowed", round(expected_num / denom, 6) if denom else None)
 
-          # Compare against StatsAPI's date-bounded sabermetrics wOBA.
-          saber = stats("hitting", "sabermetrics")
-          print("StatsAPI sabermetrics", saber)
+          stats_params = dict(
+              group="pitching", sportId=1, season=2026,
+              startDate=start, endDate=end, stats="sabermetrics",
+          )
+          s = requests.get(
+              f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats",
+              params=stats_params, timeout=30,
+          )
+          s.raise_for_status()
+          print("StatsAPI sabermetrics", s.json())
           PY
