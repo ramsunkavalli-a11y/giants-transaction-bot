@@ -4,9 +4,11 @@ from datetime import datetime
 
 import bot_core as infra
 import mlb_domain as domain
+import statcast_domain as statcast
 
 SIGNING_MLB_MIN_PA = 30
 SIGNING_MLB_MIN_IP = 10.0
+OPTION_XWOBA_MIN_PA = 40
 
 
 def _format_pct(value):
@@ -16,6 +18,15 @@ def _format_pct(value):
     if abs(number) <= 1:
         number *= 100
     return f"{int(round(number))}%"
+
+
+def _format_pct_number(value):
+    number = infra._safe_float(value)
+    if number is None:
+        return None
+    if abs(number) <= 1:
+        number *= 100
+    return int(round(number))
 
 
 def _format_slash_value(value):
@@ -285,6 +296,110 @@ def _labeled_stats(selected: dict, prefix: str, pitcher: bool):
     return f"{prefix}: {stat_text}" if stat_text else None
 
 
+def _option_usage_text(usage: dict | None):
+    if not usage:
+        return None
+    games = infra._safe_int(usage.get("games"))
+    starts = infra._safe_int(usage.get("starts"))
+    if games is None or games <= 0:
+        return None
+    if starts is None:
+        return f"{games} G"
+    return f"{games} G ({starts} GS)"
+
+
+def _option_hitter_primary(prefix: str, stat: dict, usage=None):
+    pa = infra._safe_int((stat or {}).get("plateAppearances"))
+    avg = _format_slash_value((stat or {}).get("avg"))
+    obp = _format_slash_value((stat or {}).get("obp"))
+    slg = _format_slash_value((stat or {}).get("slg"))
+    obp_num = infra._safe_float((stat or {}).get("obp"))
+    slg_num = infra._safe_float((stat or {}).get("slg"))
+    ops = _format_slash_value(obp_num + slg_num) if obp_num is not None and slg_num is not None else None
+
+    parts = []
+    usage_text = _option_usage_text(usage)
+    if usage_text:
+        parts.append(usage_text)
+    if pa is not None:
+        parts.append(f"{pa} PA")
+    if avg and obp and slg:
+        slash = f"{avg}/{obp}/{slg}"
+        if ops:
+            slash += f" ({ops} OPS)"
+        parts.append(slash)
+
+    if not parts:
+        fallback = format_stat_clause(stat, pitcher=False)
+        return f"{prefix}: {fallback}" if fallback else None
+    return f"{prefix}: {', '.join(parts)}"
+
+
+def _option_hitter_secondary(stat: dict, xwoba=None):
+    pa = infra._safe_int((stat or {}).get("plateAppearances")) or 0
+    if pa < OPTION_XWOBA_MIN_PA:
+        return None
+
+    parts = []
+    if xwoba is not None:
+        x_text = _format_slash_value(xwoba)
+        if x_text:
+            parts.append(f"{x_text} xwOBA")
+
+    strikeouts = infra._safe_int((stat or {}).get("strikeOuts"))
+    walks = infra._safe_int((stat or {}).get("baseOnBalls"))
+    k_pct = _format_pct_number((stat or {}).get("strikeoutPercentage"))
+    bb_pct = _format_pct_number((stat or {}).get("baseOnBallsPercentage"))
+    if k_pct is None and pa and strikeouts is not None:
+        k_pct = int(round(100 * strikeouts / pa))
+    if bb_pct is None and pa and walks is not None:
+        bb_pct = int(round(100 * walks / pa))
+    if k_pct is not None:
+        parts.append(f"{k_pct} K%")
+    if bb_pct is not None:
+        parts.append(f"{bb_pct} BB%")
+    return " | ".join(parts) if parts else None
+
+
+def build_option_hitter_post(base_text: str, player_link: str, prefix: str,
+                             selected: dict, usage=None, xwoba=None,
+                             max_len=infra.MAX_POST_LEN):
+    """Render a demotion as opportunity + familiar results + expected/process."""
+    stat = (selected or {}).get("splitStats") or {}
+    full_primary = _option_hitter_primary(prefix, stat, usage=usage)
+    compact_primary = _option_hitter_primary(prefix, stat, usage=None)
+    secondary = _option_hitter_secondary(stat, xwoba=xwoba)
+
+    def render(primary, detail=None):
+        lines = [base_text]
+        if primary:
+            lines.append(primary)
+        if detail:
+            lines.append(detail)
+        lines.append(player_link)
+        return "\n".join(lines)
+
+    # Keep expected/process context ahead of G/GS if a long description forces
+    # us to choose. PA + slash/OPS are preserved as long as possible.
+    attempts = [
+        render(full_primary, secondary),
+        render(compact_primary, secondary),
+        render(full_primary),
+        render(compact_primary),
+    ]
+    for post in attempts:
+        if len(post) <= max_len:
+            return post
+
+    return build_post_with_optional_stats(
+        base_text,
+        player_link,
+        _labeled_stats(selected, prefix, pitcher=False),
+        pitcher=False,
+        max_len=max_len,
+    )
+
+
 def build_special_transaction_post(tx: dict, category: str, cache: dict, now_la):
     base_text = infra.build_base_tx_text(tx)
     person_id = infra.extract_tx_player_id(tx)
@@ -314,17 +429,49 @@ def build_special_transaction_post(tx: dict, category: str, cache: dict, now_la)
                 person_id, pitcher, 1, "byDateRange", season,
                 cache=cache, start_date=start, end_date=tx_date,
             )
-            stats_line = _labeled_stats(
-                selected, f"MLB since {_short_date_label(start)}", pitcher
-            )
+            prefix = f"MLB since {_short_date_label(start)}"
+            if selected and not pitcher:
+                usage, _usage_ok = statcast.fetch_mlb_usage(
+                    person_id, False, season, start, tx_date, cache=cache
+                )
+                stat = selected.get("splitStats") or {}
+                pa = infra._safe_int(stat.get("plateAppearances")) or 0
+                xwoba = None
+                if pa >= OPTION_XWOBA_MIN_PA:
+                    xwoba, _actual, _denom, _x_ok = statcast.fetch_date_bounded_xwoba(
+                        person_id, False, season, start, tx_date, cache=cache
+                    )
+                return build_option_hitter_post(
+                    base_text, link, prefix, selected,
+                    usage=usage, xwoba=xwoba,
+                    max_len=infra.MAX_POST_LEN,
+                )
+            stats_line = _labeled_stats(selected, prefix, pitcher)
             if not stats_line and ok:
-                stats_line = f"MLB since {_short_date_label(start)}: did not appear"
+                stats_line = f"{prefix}: did not appear"
         if not stats_line:
             selected, _ok = domain.fetch_player_stat(
                 person_id, pitcher, 1, "byDateRange", season,
                 cache=cache, start_date=season_start, end_date=tx_date,
             )
-            stats_line = _labeled_stats(selected, f"{season} MLB", pitcher)
+            prefix = f"{season} MLB"
+            if selected and not pitcher:
+                usage, _usage_ok = statcast.fetch_mlb_usage(
+                    person_id, False, season, season_start, tx_date, cache=cache
+                )
+                stat = selected.get("splitStats") or {}
+                pa = infra._safe_int(stat.get("plateAppearances")) or 0
+                xwoba = None
+                if pa >= OPTION_XWOBA_MIN_PA:
+                    xwoba, _actual, _denom, _x_ok = statcast.fetch_date_bounded_xwoba(
+                        person_id, False, season, season_start, tx_date, cache=cache
+                    )
+                return build_option_hitter_post(
+                    base_text, link, prefix, selected,
+                    usage=usage, xwoba=xwoba,
+                    max_len=infra.MAX_POST_LEN,
+                )
+            stats_line = _labeled_stats(selected, prefix, pitcher)
 
     elif category == "recalled":
         start = domain.latest_prior_transaction_date(
