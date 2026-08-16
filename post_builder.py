@@ -657,9 +657,16 @@ def build_posts(new_txns, player_cache=None, season_mode=False, now_la=None):
     """Build posts without monkey-patching legacy core classification/stats."""
     cache = player_cache if player_cache is not None else {}
     now_la = now_la or infra._la_now()
-    separate_posts = []
-    grouped = []
+    posts = []
+    grouped_pending = []
     seen_rehab_assignments = set()
+
+    def flush_grouped():
+        nonlocal grouped_pending
+        if not grouped_pending:
+            return
+        posts.extend(infra.pack_posts(infra.build_date_group_blocks(grouped_pending)))
+        grouped_pending = []
 
     for tx in sorted(new_txns, key=infra.txn_id):
         # Jersey-number changes are administrative noise, including the mass
@@ -689,15 +696,16 @@ def build_posts(new_txns, player_cache=None, season_mode=False, now_la=None):
             domain.is_claimed_off_waivers_transaction(tx)
             and infra._safe_int(infra._get_in(tx, "toTeam", "id")) == infra.TEAM_ID
         ):
+            flush_grouped()
             base_text = infra.build_base_tx_text(tx)
             person_id = infra.extract_tx_player_id(tx)
             if not person_id:
-                separate_posts.append(base_text)
+                posts.append(base_text)
                 continue
             details = domain.fetch_player_details(person_id, cache=cache)
             tx_date = infra.txn_date_obj(tx) or now_la.date()
             enrichment = build_signing_enrichment(details, tx_date, cache=cache)
-            separate_posts.append(
+            posts.append(
                 build_signing_post(
                     base_text,
                     infra.player_url(person_id),
@@ -710,15 +718,16 @@ def build_posts(new_txns, player_cache=None, season_mode=False, now_la=None):
         category = domain.classify_transaction(tx, season_mode=season_mode)
 
         if category == "signing":
+            flush_grouped()
             base_text = infra.build_base_tx_text(tx)
             person_id = infra.extract_tx_player_id(tx)
             if not person_id:
-                separate_posts.append(base_text)
+                posts.append(base_text)
                 continue
             details = domain.fetch_player_details(person_id, cache=cache)
             tx_date = infra.txn_date_obj(tx) or now_la.date()
             enrichment = build_signing_enrichment(details, tx_date, cache=cache)
-            separate_posts.append(
+            posts.append(
                 build_signing_post(
                     base_text,
                     infra.player_url(person_id),
@@ -729,14 +738,12 @@ def build_posts(new_txns, player_cache=None, season_mode=False, now_la=None):
             continue
 
         if category:
-            separate_posts.append(
+            flush_grouped()
+            posts.append(
                 build_special_transaction_post(tx, category, cache, now_la)
             )
         else:
-            grouped.append(tx)
+            grouped_pending.append(tx)
 
-    grouped_posts = infra.pack_posts(infra.build_date_group_blocks(grouped))
-    return [
-        post for post in (grouped_posts + separate_posts)
-        if post and post.strip()
-    ]
+    flush_grouped()
+    return [post for post in posts if post and post.strip()]
