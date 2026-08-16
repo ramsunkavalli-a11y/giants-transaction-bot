@@ -125,6 +125,20 @@ def is_assigned_transaction(tx: dict) -> bool:
     return (tx.get("typeCode") or "").strip().upper() == "ASG"
 
 
+def is_rehab_assignment_transaction(tx: dict) -> bool:
+    return is_assigned_transaction(tx) and "rehab assignment" in _hay(tx)
+
+
+def is_generic_org_assignment_transaction(
+    tx: dict, team_name: str = "San Francisco Giants"
+) -> bool:
+    """Identify administrative org assignments without hiding rehab news."""
+    if not is_assigned_transaction(tx) or is_rehab_assignment_transaction(tx):
+        return False
+    team = str(team_name or "").strip().lower()
+    return bool(team) and f"assigned to {team}" in _hay(tx)
+
+
 def classify_transaction(tx: dict, season_mode: bool) -> str | None:
     """Return the special-post category, or None for grouped transactions."""
     if is_signing_transaction(tx):

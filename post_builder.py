@@ -659,6 +659,7 @@ def build_posts(new_txns, player_cache=None, season_mode=False, now_la=None):
     now_la = now_la or infra._la_now()
     separate_posts = []
     grouped = []
+    seen_rehab_assignments = set()
 
     for tx in sorted(new_txns, key=infra.txn_id):
         # Jersey-number changes are administrative noise, including the mass
@@ -666,6 +667,20 @@ def build_posts(new_txns, player_cache=None, season_mode=False, now_la=None):
         # handled by bot.py even when this builder intentionally emits nothing.
         if domain.is_number_change_transaction(tx):
             continue
+
+        # ASG is overloaded by StatsAPI. Plain "assigned to San Francisco
+        # Giants" records are administrative roster-loading noise; rehab
+        # assignments are useful, but the API often emits exact duplicates.
+        if domain.is_generic_org_assignment_transaction(tx):
+            continue
+        if domain.is_rehab_assignment_transaction(tx):
+            rehab_key = (
+                infra.txn_date(tx),
+                infra.txn_desc(tx).strip().lower(),
+            )
+            if rehab_key in seen_rehab_assignments:
+                continue
+            seen_rehab_assignments.add(rehab_key)
 
         # Incoming waiver claims benefit from the same date-bounded player
         # context used for signings. Outgoing claims remain grouped/plain so a
