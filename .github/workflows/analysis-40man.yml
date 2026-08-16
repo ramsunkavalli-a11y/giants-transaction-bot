@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   analyze:
-    if: github.event.head_commit.message == 'Inspect 40-man status semantics'
+    if: github.event.head_commit.message == 'Calculate adjusted MLB-wide 40-man open days'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,25 +18,124 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install requests
-      - name: Inspect roster status semantics
+      - name: Calculate adjusted daily historical 40-man occupancy
         run: |
           python - <<'PY'
-          import requests
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from datetime import date, timedelta
+          from statistics import median, mean
           from collections import Counter
+          import requests, time
+
           BASE='https://statsapi.mlb.com/api/v1'
-          cases=[(137,'2026-08-16','Giants'),(133,'2026-04-07','Athletics')]
-          for tid,d,label in cases:
-              js=requests.get(f'{BASE}/teams/{tid}/roster/40Man?date={d}',timeout=30).json()
-              roster=js.get('roster') or []
-              print('\nCASE',label,d,'RAW',len(roster))
-              c=Counter()
+          START=date(2026,3,25)
+          END=date(2026,8,16)
+          GIANTS=137
+
+          def get_json(url, tries=5):
+              last=None
+              for i in range(tries):
+                  try:
+                      r=requests.get(url, timeout=20)
+                      if r.status_code==200:
+                          return r.json()
+                      last=RuntimeError(f'{r.status_code}: {r.text[:200]}')
+                  except Exception as e:
+                      last=e
+                  time.sleep(0.4*(i+1))
+              raise last
+
+          teams=(get_json(f'{BASE}/teams?sportId=1&season=2026').get('teams') or [])
+          teams=[t for t in teams if t.get('active',True)]
+          team_map={t['id']:t['name'] for t in teams}
+          assert len(team_map)==30
+
+          days=[]; d=START
+          while d<=END:
+              days.append(d); d+=timedelta(days=1)
+
+          def fetch_one(pair):
+              tid,d=pair
+              roster=(get_json(f'{BASE}/teams/{tid}/roster/40Man?date={d.isoformat()}').get('roster') or [])
+              occ_ids=set(); raw_ids=set(); statuses=Counter()
               for x in roster:
-                  st=x.get('status') or {}
-                  code=st.get('code')
-                  desc=st.get('description')
-                  c[(code,desc)] += 1
-              print('STATUS_COUNTS',dict(c))
-              for x in roster:
-                  st=x.get('status') or {}
-                  print(x.get('person',{}).get('fullName'), st.get('code'), st.get('description'))
+                  pid=x.get('person',{}).get('id')
+                  if not pid: continue
+                  raw_ids.add(pid)
+                  code=(x.get('status') or {}).get('code') or ''
+                  statuses[code]+=1
+                  if code != 'D60':
+                      occ_ids.add(pid)
+              return tid,d,len(occ_ids),len(raw_ids),statuses
+
+          results={tid:{} for tid in team_map}
+          raw_results={tid:{} for tid in team_map}
+          status_totals=Counter()
+          pairs=[(tid,d) for d in days for tid in team_map]
+          with ThreadPoolExecutor(max_workers=32) as ex:
+              futs=[ex.submit(fetch_one,p) for p in pairs]
+              for n,f in enumerate(as_completed(futs),1):
+                  tid,d,occ,raw,sts=f.result()
+                  results[tid][d]=occ; raw_results[tid][d]=raw; status_totals.update(sts)
+                  if n%750==0: print('DONE',n,'OF',len(pairs))
+
+          over=[]
+          for tid,name in team_map.items():
+              for d,c in results[tid].items():
+                  if c>40 or c<20: over.append((name,d,c,raw_results[tid][d]))
+          print('STATUS_CODES',dict(status_totals))
+          print('ADJUSTED_OUT_OF_RANGE',over[:20], 'COUNT',len(over))
+          assert not over
+
+          def streaks(tid):
+              vals=[results[tid][d] < 40 for d in days]
+              longest=cur=0
+              for v in vals:
+                  if v: cur+=1; longest=max(longest,cur)
+                  else: cur=0
+              current=0
+              for v in reversed(vals):
+                  if v: current+=1
+                  else: break
+              return longest,current
+
+          rows=[]
+          for tid,name in team_map.items():
+              counts=[results[tid][d] for d in days]
+              open_days=sum(c<40 for c in counts)
+              longest,current=streaks(tid)
+              rows.append({'id':tid,'team':name,'open_days':open_days,'longest':longest,'current':current,
+                           'today':counts[-1],'min':min(counts),'days39':sum(c==39 for c in counts),
+                           'days38':sum(c==38 for c in counts),'days37orless':sum(c<=37 for c in counts)})
+
+          rows.sort(key=lambda r:(-r['open_days'],r['team']))
+          sf=next(r for r in rows if r['id']==GIANTS)
+          rank=1+sum(r['open_days']>sf['open_days'] for r in rows)
+          tied=sum(r['open_days']==sf['open_days'] for r in rows)
+          total_open=sum(r['open_days'] for r in rows)
+          total_team_days=len(days)*30
+
+          print('\n=== LEAGUE SUMMARY ===')
+          print('WINDOW',START,END,'DAYS',len(days))
+          print('MLB_OPEN_TEAM_DAYS',total_open,'OF',total_team_days,'PCT',round(100*total_open/total_team_days,1))
+          print('TEAM_OPEN_DAYS_MEAN',round(mean(r['open_days'] for r in rows),1))
+          print('TEAM_OPEN_DAYS_MEDIAN',median(r['open_days'] for r in rows))
+          print('TEAMS_OPEN_TODAY',sum(r['today']<40 for r in rows),'OF',len(rows))
+          print('SF',sf,'RANK_MOST_OPEN_DAYS',rank,'TIED_TEAMS',tied)
+
+          print('\n=== ALL TEAMS (most open days first) ===')
+          for i,r in enumerate(rows,1):
+              print(f"{i:2d}. {r['team']}: open_days={r['open_days']}, longest={r['longest']}, current={r['current']}, today={r['today']}/40, min={r['min']}, 39={r['days39']}, 38={r['days38']}, <=37={r['days37orless']}")
+
+          print('\n=== SF OPEN-SPOT STREAKS ===')
+          active=False; start=None
+          for d in days:
+              o=results[GIANTS][d]<40
+              if o and not active:
+                  start=d; active=True
+              if active and not o:
+                  end=d-timedelta(days=1)
+                  print(start,end,(end-start).days+1)
+                  active=False
+          if active: print(start,END,(END-start).days+1)
           PY
