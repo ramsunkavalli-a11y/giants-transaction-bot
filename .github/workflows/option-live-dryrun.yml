@@ -1,0 +1,64 @@
+name: Option live dry run
+
+on:
+  push:
+    branches:
+      - agent/enrichment-formatting-v1
+
+permissions:
+  contents: read
+
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Render real option transactions without Bluesky
+        run: |
+          python - <<'PY'
+          from datetime import datetime
+          import bot_core as infra
+          import post_builder
+
+          data = infra.request_json_with_retry(
+              "https://statsapi.mlb.com/api/v1/transactions"
+              "?teamId=137&startDate=2026-08-10&endDate=2026-08-14"
+          )
+          txns = data.get("transactions") or []
+
+          def render(piece, day):
+              matches = [
+                  tx for tx in txns
+                  if piece.lower() in infra.txn_desc(tx).lower()
+                  and infra.txn_date(tx) == day
+              ]
+              assert matches, (piece, day)
+              posts = post_builder.build_posts(
+                  [sorted(matches, key=infra.txn_id)[0]],
+                  player_cache={}, season_mode=True,
+                  now_la=datetime(2026, 8, 16, 10, 0, 0),
+              )
+              assert len(posts) == 1, posts
+              post = posts[0]
+              print("\n" + "=" * 80 + "\n" + post)
+              assert len(post) <= infra.MAX_POST_LEN
+              return post
+
+          mccray = render("optioned CF Grant McCray", "2026-08-14")
+          assert "MLB since Jul 10: 23 G (13 GS), 47 PA, .081/.227/.162 (.389 OPS)" in mccray
+          assert ".296 xwOBA | 28 K% | 15 BB%" in mccray
+          assert "28% K%" not in mccray
+
+          furman = render("optioned 2B Nate Furman", "2026-08-14")
+          assert "8 PA, .000/.250/.000 (.250 OPS)" in furman
+          assert "xwOBA" not in furman and "K%" not in furman and "BB%" not in furman
+
+          morgan = render("optioned C Zach Morgan", "2026-08-11")
+          assert "MLB since Aug 10: did not appear" in morgan
+
+          print("\nOPTION LIVE DRY RUN PASSED")
+          PY
