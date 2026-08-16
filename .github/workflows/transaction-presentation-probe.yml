@@ -17,31 +17,34 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - name: Inspect grouped-code shapes
+      - name: Preview incoming waiver claim enrichment
         run: |
           python - <<'PY'
-          import json
+          from datetime import datetime
           import bot_core as infra
+          import mlb_domain as domain
+          import post_builder
 
           data = infra.request_json_with_retry(
               "https://statsapi.mlb.com/api/v1/transactions"
-              "?teamId=137&startDate=2026-02-21&endDate=2026-08-16"
+              "?teamId=137&startDate=2026-06-01&endDate=2026-08-16"
           )
           txns = data.get("transactions") or []
-
-          print("ASG AFTER CUTOFF")
+          wanted = {672021, 671083, 694376}
           for tx in txns:
-              if (tx.get("typeCode") or "").upper() == "ASG":
-                  print(tx.get("date"), tx.get("description"))
-
-          print("\nCLW SHAPES")
-          for tx in txns:
-              if (tx.get("typeCode") or "").upper() == "CLW":
-                  print(json.dumps(tx, sort_keys=True))
-
-          print("\nOUT/REL SHAPES")
-          for tx in txns:
-              if (tx.get("typeCode") or "").upper() in {"OUT", "REL"}:
-                  keep = {k: tx.get(k) for k in ("id", "date", "typeCode", "typeDesc", "description", "person", "fromTeam", "toTeam") if tx.get(k) is not None}
-                  print(json.dumps(keep, sort_keys=True))
+              if (tx.get("typeCode") or "").upper() != "CLW":
+                  continue
+              if infra._safe_int((tx.get("toTeam") or {}).get("id")) != 137:
+                  continue
+              pid = infra.extract_tx_player_id(tx)
+              if pid not in wanted:
+                  continue
+              tx_date = infra.txn_date_obj(tx)
+              cache = {}
+              details = domain.fetch_player_details(pid, cache=cache)
+              enrichment = post_builder.build_signing_enrichment(details, tx_date, cache=cache)
+              post = post_builder.build_signing_post(
+                  infra.build_base_tx_text(tx), infra.player_url(pid), enrichment
+              )
+              print("\n" + "=" * 80 + "\n" + post)
           PY
