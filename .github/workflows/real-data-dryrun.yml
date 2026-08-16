@@ -1,0 +1,57 @@
+name: Real MLB data dry run
+
+on:
+  push:
+    branches:
+      - agent/enrichment-formatting-v1
+
+permissions:
+  contents: read
+
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Render recent real transactions without posting
+        run: |
+          python - <<'PY'
+          from datetime import datetime
+          import bot
+          import bot_core as core
+
+          url = (
+              "https://statsapi.mlb.com/api/v1/transactions"
+              "?teamId=137&startDate=2026-08-01&endDate=2026-08-14"
+          )
+          data = core.request_json_with_retry(url)
+          txns = data.get("transactions") or []
+          names = (
+              "Turner Hill", "Jonah Cox", "Grant McCray", "Nate Furman",
+              "Andrew Knizner", "Zach Morgan", "Trent Harris", "Eddys Leonard",
+          )
+          selected = [t for t in txns if any(n.lower() in core.txn_desc(t).lower() for n in names)]
+          selected.sort(key=lambda t: (core.txn_date(t), core.txn_id(t)))
+
+          print(f"Fetched {len(txns)} Giants transactions; matched {len(selected)} test transactions")
+          assert selected, "No test transactions matched"
+
+          for t in selected:
+              print("\n" + "=" * 78)
+              print("TX", core.txn_id(t), core.txn_date(t), core.txn_typecode(t), core.txn_desc(t))
+              posts = core.build_posts(
+                  [t],
+                  player_cache={},
+                  season_mode=True,
+                  now_la=datetime(2026, 8, 16, 10, 0, 0),
+              )
+              assert posts, f"No post rendered for transaction {core.txn_id(t)}"
+              for p in posts:
+                  print("POST:\n" + p)
+                  print("LENGTH:", len(p))
+                  assert len(p) <= core.MAX_POST_LEN, len(p)
+          PY
