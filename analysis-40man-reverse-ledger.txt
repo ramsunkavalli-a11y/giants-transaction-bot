@@ -1,0 +1,106 @@
+CURRENT_ANCHORS
+Arizona Diamondbacks     39 recon []
+Athletics                40 recon []
+Atlanta Braves           38 recon []
+Baltimore Orioles        40 recon []
+Boston Red Sox           37 recon []
+Chicago Cubs             40 recon []
+Chicago White Sox        40 recon []
+Cincinnati Reds          39 recon []
+Cleveland Guardians      39 recon []
+Colorado Rockies         37 recon []
+Detroit Tigers           40 recon []
+Houston Astros           40 recon []
+Kansas City Royals       39 recon []
+Los Angeles Angels       40 recon []
+Los Angeles Dodgers      40 recon []
+Miami Marlins            40 recon []
+Milwaukee Brewers        40 recon []
+Minnesota Twins          40 recon []
+New York Mets            40 recon []
+New York Yankees         40 recon []
+Philadelphia Phillies    40 recon []
+Pittsburgh Pirates       40 recon []
+San Diego Padres         40 recon []
+San Francisco Giants     40 recon [(700280, 'Miguel Mendez')]
+Seattle Mariners         40 recon []
+St. Louis Cardinals      38 recon []
+Tampa Bay Rays           40 recon []
+Texas Rangers            39 recon []
+Toronto Blue Jays        40 recon []
+Washington Nationals     39 recon []
+
+CURRENT_STATUS_CODES
+('A', 'Active') 779
+('D10', 'Injured 10-Day') 49
+('D15', 'Injured 15-Day') 50
+('D60', 'Injured 60-Day') 170
+('D7', 'Injured 7-Day') 3
+('RM', 'Reassigned to Minors') 303
+
+REVERSE_LEDGER_RANKING
+ 1. Atlanta Braves           124
+ 2. Baltimore Orioles         85
+ 3. New York Yankees          76
+ 4. Los Angeles Angels        65
+ 5. Toronto Blue Jays         49
+ 6. St. Louis Cardinals       48
+ 7. Chicago White Sox         43
+ 8. Athletics                 42
+ 9. New York Mets             39
+10. Seattle Mariners          37
+11. Chicago Cubs              34
+12. Cleveland Guardians       30
+13. Cincinnati Reds           29
+14. San Diego Padres          29
+15. Texas Rangers             27
+16. Boston Red Sox            26
+17. Washington Nationals      23
+18. Colorado Rockies          18
+19. Houston Astros            18
+20. Miami Marlins             18
+21. San Francisco Giants      15
+22. Arizona Diamondbacks      13
+23. Milwaukee Brewers         11
+24. Detroit Tigers             8
+25. Los Angeles Dodgers        5
+26. Minnesota Twins            3
+27. Philadelphia Phillies      2
+28. Kansas City Royals         0
+29. Pittsburgh Pirates         0
+30. Tampa Bay Rays             0
+
+ATL_ANCHORS
+2026-03-25 39
+2026-03-29 39
+2026-03-30 40
+2026-04-10 40
+2026-04-11 40
+2026-04-12 39
+2026-04-13 38
+2026-04-16 38
+2026-04-17 39
+2026-04-22 38
+2026-04-23 40
+2026-06-11 39
+2026-06-12 39
+2026-06-15 38
+2026-06-16 39
+2026-07-07 39
+2026-08-01 38
+2026-08-02 39
+2026-08-03 39
+2026-08-16 39
+
+ATL_STREAKS
+2026-03-25 2026-03-29 5 min 39
+2026-04-12 2026-04-22 11 min 38
+2026-04-29 2026-05-02 4 min 38
+2026-05-04 2026-06-16 44 min 38
+2026-06-18 2026-08-16 60 min 37
+
+SELECTED_TEAM_ANCHORS
+San Francisco Giants Mar25 40 Aug16 40
+Baltimore Orioles Mar25 37 Aug16 40
+San Diego Padres Mar25 40 Aug16 40
+New York Mets Mar25 39 Aug16 40
