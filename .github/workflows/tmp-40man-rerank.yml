@@ -26,6 +26,7 @@ jobs:
       - name: Recompute MLB-wide rankings and audit Atlanta
         run: |
           python - <<'PY' > analysis-40man-rerank.txt
+          from concurrent.futures import ThreadPoolExecutor, as_completed
           from datetime import date, timedelta
           import bot_core as infra
           import roster_intelligence as ri
@@ -33,29 +34,42 @@ jobs:
 
           START=date(2026,3,25)
           END=date(2026,8,16)
-          cache={}
           teams_data=infra.request_json_with_retry('https://statsapi.mlb.com/api/v1/teams?sportId=1&season=2026')
           teams=[(int(t['id']), t['name']) for t in teams_data.get('teams',[]) if t.get('sport',{}).get('id')==1]
           print('TEAM_COUNT',len(teams),'WINDOW',START,END,'DAYS',(END-START).days+1)
-          results=[]; all_counts={}; all_recon={}
-          for idx,(tid,name) in enumerate(sorted(teams,key=lambda x:x[1]),1):
+
+          def run_team(team):
+              tid,name=team
+              cache={}
               counts,recon,ok=ri.daily_40man_counts(tid,START,END,cache=cache)
               if not ok:
-                  print('FAILED',tid,name)
-                  continue
+                  return tid,name,None,None,None
               txs,txok=ri.fetch_team_transactions(tid,START,END,cache=cache)
               if txok:
                   counts=roster_daily.normalize_isolated_transaction_dips(counts,txs,tid)
-              open_days=sum(v<40 for v in counts.values())
-              results.append((open_days,tid,name)); all_counts[tid]=counts; all_recon[tid]=recon
-              print('PROGRESS',idx,name,open_days,'RECON_DAYS',len(recon))
+              return tid,name,counts,recon,txs if txok else []
+
+          data={}
+          with ThreadPoolExecutor(max_workers=10) as ex:
+              futs={ex.submit(run_team,t):t for t in teams}
+              for fut in as_completed(futs):
+                  tid,name,counts,recon,txs=fut.result()
+                  if counts is None:
+                      print('FAILED',tid,name)
+                  else:
+                      data[tid]=(name,counts,recon,txs)
+                      print('DONE',name,sum(v<40 for v in counts.values()),'RECON_DAYS',len(recon))
+
+          results=[]
+          for tid,(name,counts,recon,txs) in data.items():
+              results.append((sum(v<40 for v in counts.values()),tid,name))
 
           print('\nRANKING')
-          for rank,(days,tid,name) in enumerate(sorted(results,reverse=True),1):
+          for rank,(days,tid,name) in enumerate(sorted(results,key=lambda x:(-x[0],x[2])),1):
               print(f'{rank:2d}. {name:24s} {days:3d}')
 
           tid,name=next(x for x in teams if x[1]=='Atlanta Braves')
-          counts=all_counts[tid]; recon=all_recon[tid]
+          name,counts,recon,txs=data[tid]
           print('\nATL_DISTRIBUTION')
           for c in sorted(set(counts.values()), reverse=True):
               print(c, sum(v==c for v in counts.values()))
@@ -84,7 +98,6 @@ jobs:
                   st=prev=None
           if st is not None: print(st,prev,(prev-st).days+1,'min',min(counts[x] for x in counts if st<=x<=prev))
 
-          txs,_=ri.fetch_team_transactions(tid,START,END,cache=cache)
           bydate={}
           for tx in txs:
               d=infra.txn_date_obj(tx)
