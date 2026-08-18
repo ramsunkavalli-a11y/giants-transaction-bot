@@ -7,13 +7,9 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: temporary-40man-rerank
-  cancel-in-progress: true
-
 jobs:
   rerank:
-    if: github.event.head_commit.message == 'Temporary rerun of MLB 40-man rankings'
+    if: github.event.head_commit.message == 'Run Atlanta roster diff audit'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,124 +19,49 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -r requirements.txt
-      - name: Recompute MLB-wide rankings and audit Atlanta
+      - name: Audit Atlanta roster membership diffs
         run: |
-          python - <<'PY' > analysis-40man-rerank.txt
-          from concurrent.futures import ThreadPoolExecutor, as_completed
-          from collections import defaultdict
-          from datetime import date, timedelta
+          python - <<'PY' > analysis-atl-roster-diffs.txt
+          from datetime import date,timedelta
           import bot_core as infra
-          import roster_intelligence as ri
-          import roster_daily
 
-          START=date(2026,3,25); END=date(2026,8,16)
-          teams_data=infra.request_json_with_retry('https://statsapi.mlb.com/api/v1/teams?sportId=1&season=2026')
-          teams=[(int(t['id']), t['name']) for t in teams_data.get('teams',[]) if t.get('sport',{}).get('id')==1]
-          team_name={tid:name for tid,name in teams}
-          dates=[]; d=START
-          while d<=END: dates.append(d); d+=timedelta(days=1)
-          print('TEAM_COUNT',len(teams),'WINDOW',START,END,'DAYS',len(dates))
-
-          def get_snapshot(tid,d):
-              url=f'https://statsapi.mlb.com/api/v1/teams/{tid}/roster/40Man?date={d.isoformat()}'
-              data=infra.request_json_with_retry(url, timeout=12, retries=3)
-              members={}
-              for item in data.get('roster') or []:
-                  p=item.get('person') or {}; s=item.get('status') or {}
+          tid=144
+          ranges=[(date(2026,4,9),date(2026,4,25)),(date(2026,6,9),date(2026,6,17)),(date(2026,7,5),date(2026,7,11)),(date(2026,7,17),date(2026,7,23)),(date(2026,7,30),date(2026,8,5))]
+          def roster(d):
+              u=f'https://statsapi.mlb.com/api/v1/teams/{tid}/roster/40Man?date={d}'
+              data=infra.request_json_with_retry(u)
+              m={}
+              for it in data.get('roster') or []:
+                  p=it.get('person') or {}; s=it.get('status') or {}
+                  if (s.get('code') or '').upper()=='D60': continue
                   pid=infra._safe_int(p.get('id'))
-                  if pid and (s.get('code') or '').upper()!='D60':
-                      members[pid]=p.get('fullName') or str(pid)
-              return tid,d,members
-
-          snapshots=defaultdict(dict)
-          failures=[]
-          jobs=[]
-          with ThreadPoolExecutor(max_workers=40) as ex:
-              for tid,_ in teams:
-                  for d in dates: jobs.append(ex.submit(get_snapshot,tid,d))
-              for i,fut in enumerate(as_completed(jobs),1):
-                  try:
-                      tid,d,members=fut.result(); snapshots[tid][d]=members
-                  except Exception as e:
-                      failures.append(repr(e))
-                  if i%500==0: print('SNAPSHOTS',i,'FAIL',len(failures))
-          print('SNAPSHOT_FAILURES',len(failures))
-          if failures: print('FIRST_FAILURE',failures[0])
-
-          results=[]; final_counts={}; recons={}; tx_by_team={}
-          for tid,name in teams:
-              cache={}
-              windows,wok=ri.build_trade_exception_windows(tid,START,END,cache=cache)
-              if not wok: windows=[]
-              counts={}; recon={}
-              for d in dates:
-                  members=dict(snapshots[tid][d])
-                  adds=[]
-                  for w in windows:
-                      st=ri._as_date(w.get('start')); en=ri._as_date(w.get('end_exclusive')); pid=infra._safe_int(w.get('person_id'))
-                      if st and pid and d>=st and (not en or d<en) and pid not in members:
-                          members[pid]=w.get('name') or str(pid); adds.append(w)
-                  counts[d]=min(40,len(members))
-                  if adds: recon[d]=adds
-              txs,txok=ri.fetch_team_transactions(tid,START,END,cache=cache)
-              if txok:
-                  # Same production normalization; most team transactions carry MLB team ids.
-                  counts=roster_daily.normalize_isolated_transaction_dips(counts,txs,tid)
-                  tx_by_team[tid]=txs
-              else: tx_by_team[tid]=[]
-              final_counts[tid]=counts; recons[tid]=recon
-              results.append((sum(c<40 for c in counts.values()),tid,name))
-
-          print('\nRANKING')
-          for rank,(days,tid,name) in enumerate(sorted(results,key=lambda x:(-x[0],x[2])),1):
-              print(f'{rank:2d}. {name:24s} {days:3d}')
-
-          tid=144; name=team_name[tid]; counts=final_counts[tid]; recon=recons[tid]; txs=tx_by_team[tid]
-          print('\nATL_DISTRIBUTION')
-          for c in sorted(set(counts.values()),reverse=True): print(c,sum(v==c for v in counts.values()))
-          print('ATL_RECONCILIATION_DAYS',len(recon))
-          for d,adds in sorted(recon.items()): print('ATL_RECON',d,[(a.get('person_id'),a.get('name'),a.get('start'),a.get('end_exclusive')) for a in adds])
-
-          print('\nATL_RUNS')
-          rs=None; prev=None; rc=None
-          for d in dates:
-              c=counts[d]
-              if rs is None: rs=prev=d; rc=c
-              elif c==rc and d==prev+timedelta(days=1): prev=d
-              else:
-                  print(rs,prev,rc,(prev-rs).days+1); rs=prev=d; rc=c
-          print(rs,prev,rc,(prev-rs).days+1)
-
-          print('\nATL_OPEN_STREAKS')
-          st=None; prev=None
-          for d in dates:
-              if counts[d]<40:
-                  if st is None: st=d
-                  prev=d
-              elif st is not None:
-                  print(st,prev,(prev-st).days+1,'min',min(counts[x] for x in dates if st<=x<=prev)); st=prev=None
-          if st is not None: print(st,prev,(prev-st).days+1,'min',min(counts[x] for x in dates if st<=x<=prev))
-
-          bydate=defaultdict(list)
-          for tx in txs:
-              td=infra.txn_date_obj(tx)
-              if td: bydate[td].append(tx)
-          print('\nATL_TRANSITIONS')
-          pc=None
-          for d in dates:
-              c=counts[d]
-              if pc is not None and c!=pc:
-                  print('CHANGE',d,pc,'->',c)
-                  for q in (d-timedelta(days=1),d,d+timedelta(days=1)):
-                      for tx in bydate[q]: print(' TX',q,tx.get('typeCode'),tx.get('description'))
-              pc=c
+                  if pid: m[pid]=p.get('fullName')
+              return m
+          txdata=infra.request_json_with_retry('https://statsapi.mlb.com/api/v1/transactions?teamId=144&startDate=2026-03-25&endDate=2026-08-16')
+          by={}
+          for tx in txdata.get('transactions') or []:
+              ds=str(tx.get('date') or tx.get('effectiveDate') or tx.get('transactionDate') or '')[:10]
+              by.setdefault(ds,[]).append(tx)
+          for start,end in ranges:
+              print('\nRANGE',start,end)
+              prev=None; d=start
+              while d<=end:
+                  cur=roster(d)
+                  print('\nDATE',d,'COUNT',len(cur))
+                  if prev is not None:
+                      added=[cur[x] for x in cur.keys()-prev.keys()]
+                      removed=[prev[x] for x in prev.keys()-cur.keys()]
+                      print(' ADDED',added)
+                      print(' REMOVED',removed)
+                  for tx in by.get(str(d),[]):
+                      print(' TX',tx.get('typeCode'),tx.get('description'))
+                  prev=cur; d+=timedelta(days=1)
           PY
-
-      - name: Commit analysis result
+      - name: Commit result
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add analysis-40man-rerank.txt
-          git commit -m "Temporary 40-man rerank result"
+          git add analysis-atl-roster-diffs.txt
+          git commit -m "Temporary Atlanta roster diff result"
           git pull --rebase origin main
           git push origin main
