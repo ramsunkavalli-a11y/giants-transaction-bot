@@ -27,90 +27,113 @@ jobs:
         run: |
           python - <<'PY' > analysis-40man-rerank.txt
           from concurrent.futures import ThreadPoolExecutor, as_completed
+          from collections import defaultdict
           from datetime import date, timedelta
           import bot_core as infra
           import roster_intelligence as ri
           import roster_daily
 
-          START=date(2026,3,25)
-          END=date(2026,8,16)
+          START=date(2026,3,25); END=date(2026,8,16)
           teams_data=infra.request_json_with_retry('https://statsapi.mlb.com/api/v1/teams?sportId=1&season=2026')
           teams=[(int(t['id']), t['name']) for t in teams_data.get('teams',[]) if t.get('sport',{}).get('id')==1]
-          print('TEAM_COUNT',len(teams),'WINDOW',START,END,'DAYS',(END-START).days+1)
+          team_name={tid:name for tid,name in teams}
+          dates=[]; d=START
+          while d<=END: dates.append(d); d+=timedelta(days=1)
+          print('TEAM_COUNT',len(teams),'WINDOW',START,END,'DAYS',len(dates))
 
-          def run_team(team):
-              tid,name=team
+          def get_snapshot(tid,d):
+              url=f'https://statsapi.mlb.com/api/v1/teams/{tid}/roster/40Man?date={d.isoformat()}'
+              data=infra.request_json_with_retry(url, timeout=12, retries=3)
+              members={}
+              for item in data.get('roster') or []:
+                  p=item.get('person') or {}; s=item.get('status') or {}
+                  pid=infra._safe_int(p.get('id'))
+                  if pid and (s.get('code') or '').upper()!='D60':
+                      members[pid]=p.get('fullName') or str(pid)
+              return tid,d,members
+
+          snapshots=defaultdict(dict)
+          failures=[]
+          jobs=[]
+          with ThreadPoolExecutor(max_workers=40) as ex:
+              for tid,_ in teams:
+                  for d in dates: jobs.append(ex.submit(get_snapshot,tid,d))
+              for i,fut in enumerate(as_completed(jobs),1):
+                  try:
+                      tid,d,members=fut.result(); snapshots[tid][d]=members
+                  except Exception as e:
+                      failures.append(repr(e))
+                  if i%500==0: print('SNAPSHOTS',i,'FAIL',len(failures))
+          print('SNAPSHOT_FAILURES',len(failures))
+          if failures: print('FIRST_FAILURE',failures[0])
+
+          results=[]; final_counts={}; recons={}; tx_by_team={}
+          for tid,name in teams:
               cache={}
-              counts,recon,ok=ri.daily_40man_counts(tid,START,END,cache=cache)
-              if not ok:
-                  return tid,name,None,None,None
+              windows,wok=ri.build_trade_exception_windows(tid,START,END,cache=cache)
+              if not wok: windows=[]
+              counts={}; recon={}
+              for d in dates:
+                  members=dict(snapshots[tid][d])
+                  adds=[]
+                  for w in windows:
+                      st=ri._as_date(w.get('start')); en=ri._as_date(w.get('end_exclusive')); pid=infra._safe_int(w.get('person_id'))
+                      if st and pid and d>=st and (not en or d<en) and pid not in members:
+                          members[pid]=w.get('name') or str(pid); adds.append(w)
+                  counts[d]=min(40,len(members))
+                  if adds: recon[d]=adds
               txs,txok=ri.fetch_team_transactions(tid,START,END,cache=cache)
               if txok:
+                  # Same production normalization; most team transactions carry MLB team ids.
                   counts=roster_daily.normalize_isolated_transaction_dips(counts,txs,tid)
-              return tid,name,counts,recon,txs if txok else []
-
-          data={}
-          with ThreadPoolExecutor(max_workers=10) as ex:
-              futs={ex.submit(run_team,t):t for t in teams}
-              for fut in as_completed(futs):
-                  tid,name,counts,recon,txs=fut.result()
-                  if counts is None:
-                      print('FAILED',tid,name)
-                  else:
-                      data[tid]=(name,counts,recon,txs)
-                      print('DONE',name,sum(v<40 for v in counts.values()),'RECON_DAYS',len(recon))
-
-          results=[]
-          for tid,(name,counts,recon,txs) in data.items():
-              results.append((sum(v<40 for v in counts.values()),tid,name))
+                  tx_by_team[tid]=txs
+              else: tx_by_team[tid]=[]
+              final_counts[tid]=counts; recons[tid]=recon
+              results.append((sum(c<40 for c in counts.values()),tid,name))
 
           print('\nRANKING')
           for rank,(days,tid,name) in enumerate(sorted(results,key=lambda x:(-x[0],x[2])),1):
               print(f'{rank:2d}. {name:24s} {days:3d}')
 
-          tid,name=next(x for x in teams if x[1]=='Atlanta Braves')
-          name,counts,recon,txs=data[tid]
+          tid=144; name=team_name[tid]; counts=final_counts[tid]; recon=recons[tid]; txs=tx_by_team[tid]
           print('\nATL_DISTRIBUTION')
-          for c in sorted(set(counts.values()), reverse=True):
-              print(c, sum(v==c for v in counts.values()))
+          for c in sorted(set(counts.values()),reverse=True): print(c,sum(v==c for v in counts.values()))
           print('ATL_RECONCILIATION_DAYS',len(recon))
-          for d,adds in sorted(recon.items()): print('ATL_RECON',d,adds)
+          for d,adds in sorted(recon.items()): print('ATL_RECON',d,[(a.get('person_id'),a.get('name'),a.get('start'),a.get('end_exclusive')) for a in adds])
 
           print('\nATL_RUNS')
-          run_start=None; prev=None; run_count=None
-          for d in sorted(counts):
+          rs=None; prev=None; rc=None
+          for d in dates:
               c=counts[d]
-              if run_start is None: run_start=prev=d; run_count=c
-              elif c==run_count and d==prev+timedelta(days=1): prev=d
+              if rs is None: rs=prev=d; rc=c
+              elif c==rc and d==prev+timedelta(days=1): prev=d
               else:
-                  print(run_start,prev,run_count,(prev-run_start).days+1)
-                  run_start=prev=d; run_count=c
-          if run_start is not None: print(run_start,prev,run_count,(prev-run_start).days+1)
+                  print(rs,prev,rc,(prev-rs).days+1); rs=prev=d; rc=c
+          print(rs,prev,rc,(prev-rs).days+1)
 
           print('\nATL_OPEN_STREAKS')
           st=None; prev=None
-          for d in sorted(counts):
-              if counts[d] < 40:
+          for d in dates:
+              if counts[d]<40:
                   if st is None: st=d
                   prev=d
               elif st is not None:
-                  print(st,prev,(prev-st).days+1,'min',min(counts[x] for x in counts if st<=x<=prev))
-                  st=prev=None
-          if st is not None: print(st,prev,(prev-st).days+1,'min',min(counts[x] for x in counts if st<=x<=prev))
+                  print(st,prev,(prev-st).days+1,'min',min(counts[x] for x in dates if st<=x<=prev)); st=prev=None
+          if st is not None: print(st,prev,(prev-st).days+1,'min',min(counts[x] for x in dates if st<=x<=prev))
 
-          bydate={}
+          bydate=defaultdict(list)
           for tx in txs:
-              d=infra.txn_date_obj(tx)
-              if d: bydate.setdefault(d,[]).append(tx)
+              td=infra.txn_date_obj(tx)
+              if td: bydate[td].append(tx)
           print('\nATL_TRANSITIONS')
-          prev_count=None
-          for d in sorted(counts):
+          pc=None
+          for d in dates:
               c=counts[d]
-              if prev_count is not None and c!=prev_count:
-                  print('CHANGE',d,prev_count,'->',c)
+              if pc is not None and c!=pc:
+                  print('CHANGE',d,pc,'->',c)
                   for q in (d-timedelta(days=1),d,d+timedelta(days=1)):
-                      for tx in bydate.get(q,[]): print(' TX',q,tx.get('typeCode'),tx.get('description'))
-              prev_count=c
+                      for tx in bydate[q]: print(' TX',q,tx.get('typeCode'),tx.get('description'))
+              pc=c
           PY
 
       - name: Commit analysis result
