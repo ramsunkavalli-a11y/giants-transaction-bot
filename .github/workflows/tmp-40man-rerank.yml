@@ -1,0 +1,112 @@
+name: Temporary 40-man rerank
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  rerank:
+    if: github.event.head_commit.message == 'Temporary rerun of MLB 40-man rankings'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Recompute MLB-wide rankings and audit Atlanta
+        run: |
+          python - <<'PY'
+          from datetime import date, timedelta
+          import bot_core as infra
+          import roster_intelligence as ri
+          import roster_daily
+
+          START=date(2026,3,25)
+          END=date(2026,8,16)
+          cache={}
+          teams_data=infra.request_json_with_retry('https://statsapi.mlb.com/api/v1/teams?sportId=1&season=2026')
+          teams=[(int(t['id']), t['name']) for t in teams_data.get('teams',[]) if t.get('sport',{}).get('id')==1]
+          print('TEAM_COUNT',len(teams),'WINDOW',START,END,'DAYS',(END-START).days+1)
+          results=[]
+          all_counts={}
+          all_recon={}
+          for idx,(tid,name) in enumerate(sorted(teams,key=lambda x:x[1]),1):
+              counts,recon,ok=ri.daily_40man_counts(tid,START,END,cache=cache)
+              if not ok:
+                  print('FAILED',tid,name)
+                  continue
+              txs,txok=ri.fetch_team_transactions(tid,START,END,cache=cache)
+              if txok:
+                  counts=roster_daily.normalize_isolated_transaction_dips(counts,txs,tid)
+              open_days=sum(v<40 for v in counts.values())
+              results.append((open_days,tid,name))
+              all_counts[tid]=counts
+              all_recon[tid]=recon
+              print('PROGRESS',idx,name,open_days,'RECON_DAYS',len(recon))
+
+          print('\nRANKING')
+          for rank,(days,tid,name) in enumerate(sorted(results,reverse=True),1):
+              print(f'{rank:2d}. {name:24s} {days:3d}')
+
+          atl=next((x for x in teams if x[1]=='Atlanta Braves'),None)
+          if not atl:
+              raise SystemExit('Atlanta not found')
+          tid,name=atl
+          counts=all_counts[tid]
+          recon=all_recon[tid]
+          print('\nATL_DISTRIBUTION')
+          for c in sorted(set(counts.values()), reverse=True):
+              print(c, sum(v==c for v in counts.values()))
+          print('ATL_RECONCILIATION_DAYS',len(recon))
+          for d,adds in sorted(recon.items()):
+              print('ATL_RECON',d,adds)
+
+          # Streaks by exact occupancy; easier to see whether one long 39 explains total.
+          print('\nATL_RUNS')
+          run_start=None; prev=None; run_count=None
+          for d in sorted(counts):
+              c=counts[d]
+              if run_start is None:
+                  run_start=prev=d; run_count=c
+              elif c==run_count and d==prev+timedelta(days=1):
+                  prev=d
+              else:
+                  print(run_start,prev,run_count,(prev-run_start).days+1)
+                  run_start=prev=d; run_count=c
+          if run_start is not None:
+              print(run_start,prev,run_count,(prev-run_start).days+1)
+
+          # Open-streak summary.
+          print('\nATL_OPEN_STREAKS')
+          st=None; prev=None
+          for d in sorted(counts):
+              if counts[d] < 40:
+                  if st is None: st=d
+                  prev=d
+              elif st is not None:
+                  print(st,prev,(prev-st).days+1,'min',min(counts[x] for x in counts if st<=x<=prev))
+                  st=prev=None
+          if st is not None:
+              print(st,prev,(prev-st).days+1,'min',min(counts[x] for x in counts if st<=x<=prev))
+
+          # Print Atlanta transactions on days where occupancy changes, plus day before/after.
+          txs,_=ri.fetch_team_transactions(tid,START,END,cache=cache)
+          bydate={}
+          for tx in txs:
+              d=infra.txn_date_obj(tx)
+              if d: bydate.setdefault(d,[]).append(tx)
+          print('\nATL_TRANSITIONS')
+          prev_count=None
+          for d in sorted(counts):
+              c=counts[d]
+              if prev_count is not None and c!=prev_count:
+                  print('CHANGE',d,prev_count,'->',c)
+                  for q in (d-timedelta(days=1),d,d+timedelta(days=1)):
+                      for tx in bydate.get(q,[]):
+                          print(' TX',q,tx.get('typeCode'),tx.get('description'))
+              prev_count=c
+          PY
