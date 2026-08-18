@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   rerank:
-    if: github.event.head_commit.message == 'Run reverse-ledger 40-man audit'
+    if: github.event.head_commit.message == 'Run forward-ledger 40-man audit'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,9 +19,9 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -r requirements.txt
-      - name: Reconstruct 40-man counts backward from current rosters
+      - name: Reconstruct 40-man counts forward from Opening Day
         run: |
-          python - <<'PY' > analysis-40man-reverse-ledger.txt
+          python - <<'PY' > analysis-40man-forward-ledger.txt
           from concurrent.futures import ThreadPoolExecutor, as_completed
           from collections import defaultdict
           from datetime import date, timedelta
@@ -29,19 +29,15 @@ jobs:
           import roster_intelligence as ri
           import mlb_domain as domain
 
-          START=date(2026,3,1)
-          COUNT_START=date(2026,3,25)
-          ANCHOR=date(2026,8,18)
-          END=date(2026,8,16)
-
+          START=date(2026,3,25); END=date(2026,8,16)
           tdata=infra.request_json_with_retry('https://statsapi.mlb.com/api/v1/teams?sportId=1&season=2026')
           teams=[(int(t['id']),t['name']) for t in tdata.get('teams',[]) if t.get('sport',{}).get('id')==1]
           names={tid:name for tid,name in teams}
 
-          def current_team(team):
-              tid,name=team; cache={}
-              data=infra.request_json_with_retry(f'https://statsapi.mlb.com/api/v1/teams/{tid}/roster/40Man')
-              members=set(); statuses=defaultdict(int); pnames={}
+          def seed_team(team):
+              tid,name=team
+              data=infra.request_json_with_retry(f'https://statsapi.mlb.com/api/v1/teams/{tid}/roster/40Man?date={START.isoformat()}')
+              members=set(); pnames={}; statuses=defaultdict(int)
               for it in data.get('roster') or []:
                   p=it.get('person') or {}; st=it.get('status') or {}
                   pid=infra._safe_int(p.get('id')); nm=p.get('fullName') or str(pid)
@@ -49,157 +45,117 @@ jobs:
                   statuses[(code,st.get('description') or '')]+=1
                   if not pid: continue
                   pnames[pid]=nm
-                  if code=='D60' or code=='SU' or 'restricted' in desc or 'suspend' in desc:
+                  if code=='D60' or code=='SU' or 'restricted' in desc:
                       continue
                   members.add(pid)
-              windows,wok=ri.build_trade_exception_windows(tid,COUNT_START,ANCHOR,cache=cache)
-              adds=[]
-              if wok:
-                  for w in windows:
-                      st=ri._as_date(w.get('start')); en=ri._as_date(w.get('end_exclusive')); pid=infra._safe_int(w.get('person_id'))
-                      if st and pid and ANCHOR>=st and (not en or ANCHOR<en) and pid not in members:
-                          members.add(pid); adds.append((pid,w.get('name')))
-              txs,ok=ri.fetch_team_transactions(tid,START,ANCHOR,cache=cache)
-              return tid,name,members,dict(statuses),pnames,adds,(txs if ok else [])
+              txs,ok=ri.fetch_team_transactions(tid,START+timedelta(days=1),END,cache={})
+              return tid,name,members,pnames,dict(statuses),(txs if ok else [])
 
-          sets={}; status_summary={}; player_names={}; txfeeds={}; anchor_adds={}
+          sets={}; txfeeds={}; player_names={}; seed_status={}
           with ThreadPoolExecutor(max_workers=12) as ex:
-              for f in as_completed([ex.submit(current_team,t) for t in teams]):
-                  tid,name,members,statuses,pnames,adds,txs=f.result()
-                  sets[tid]=set(members); status_summary[tid]=statuses; player_names.update(pnames); anchor_adds[tid]=adds; txfeeds[tid]=txs
+              for f in as_completed([ex.submit(seed_team,t) for t in teams]):
+                  tid,name,members,pnames,statuses,txs=f.result()
+                  sets[tid]=set(members); player_names.update(pnames); seed_status[tid]=statuses; txfeeds[tid]=txs
 
-          print('CURRENT_ANCHORS')
-          for tid,name in sorted(teams,key=lambda x:x[1]):
-              print(f'{name:24s} {len(sets[tid]):2d}', 'recon',anchor_adds[tid])
-          print('\nCURRENT_STATUS_CODES')
-          allstatuses=defaultdict(int)
-          for st in status_summary.values():
-              for k,v in st.items(): allstatuses[k]+=v
-          for k,v in sorted(allstatuses.items()): print(k,v)
+          print('OPENING_DAY_SEEDS')
+          for tid,name in sorted(teams,key=lambda x:x[1]): print(f'{name:24s} {len(sets[tid]):2d}')
 
-          # Team-local event lists and a de-duplicated global trade list.
-          perday=defaultdict(lambda:defaultdict(list)); trades_by_day=defaultdict(dict)
-          player_team_events=defaultdict(list)
+          # Team-local non-trade events; global deduplicated trade rows.
+          perday=defaultdict(lambda:defaultdict(list)); trades=defaultdict(dict)
           for tid,name in teams:
               seen=set()
               for tx in txfeeds[tid]:
-                  d=infra.txn_date_obj(tx); pid=infra.extract_tx_player_id(tx); code=(tx.get('typeCode') or '').strip().upper(); txid=infra.txn_id(tx)
+                  d=infra.txn_date_obj(tx); pid=infra.extract_tx_player_id(tx); txid=infra.txn_id(tx); code=(tx.get('typeCode') or '').strip().upper()
                   if not d or not pid: continue
                   nm=infra._clean_text(infra._get_in(tx,'person','fullName'))
                   if nm: player_names[pid]=nm
                   fr=infra._safe_int(infra._get_in(tx,'fromTeam','id')); to=infra._safe_int(infra._get_in(tx,'toTeam','id'))
                   if domain.is_trade_transaction(tx):
-                      key=(txid,pid,fr,to)
-                      trades_by_day[d][key]=tx
-                      continue
-                  key=(txid,pid,code,tx.get('description') or '')
-                  if key in seen: continue
-                  seen.add(key); perday[d][tid].append(tx); player_team_events[(tid,pid)].append(tx)
+                      trades[d][(txid,pid,fr,to)]=tx
+                  else:
+                      key=(txid,pid,code,tx.get('description') or '')
+                      if key not in seen:
+                          seen.add(key); perday[d][tid].append(tx)
 
-          for key,evs in player_team_events.items():
-              evs.sort(key=lambda x:(infra.txn_date_obj(x) or date.min,infra.txn_id(x)))
+          def team_desc(tx,tid):
+              return (tx.get('description') or '').lower().startswith(names[tid].lower())
 
-          def is_team_desc(tx,tid):
+          def restricted_off(tx,tid):
               desc=(tx.get('description') or '').lower()
-              return desc.startswith(names[tid].lower())
+              return team_desc(tx,tid) and 'restricted list' in desc and ('placed' in desc or 'transferred' in desc)
 
-          def restricted_create(tx,tid):
+          def restricted_on(tx,tid):
               desc=(tx.get('description') or '').lower()
-              return is_team_desc(tx,tid) and ('restricted list' in desc or 'suspended list' in desc) and ('placed' in desc or 'transferred' in desc)
-
-          def restricted_return(tx,tid):
-              desc=(tx.get('description') or '').lower()
-              return is_team_desc(tx,tid) and ('restricted list' in desc or 'suspended list' in desc) and ('activated' in desc or 'reinstated' in desc) and 'from' in desc
+              return team_desc(tx,tid) and 'restricted list' in desc and ('activated' in desc or 'reinstated' in desc) and 'from' in desc
 
           def major_signing(tx,tid):
               desc=(tx.get('description') or '').lower()
-              return is_team_desc(tx,tid) and domain.is_signing_transaction(tx) and 'major league contract' in desc
+              if not team_desc(tx,tid) or not domain.is_signing_transaction(tx) or 'minor league contract' in desc:
+                  return False
+              return 'major league contract' in desc
 
-          def clear_state(tx,tid):
-              # State immediately AFTER this transaction, when independently clear.
-              code=(tx.get('typeCode') or '').strip().upper(); desc=(tx.get('description') or '').lower()
-              fr=infra._safe_int(infra._get_in(tx,'fromTeam','id')); to=infra._safe_int(infra._get_in(tx,'toTeam','id'))
-              if domain.is_dfa_transaction(tx): return False
-              if ri.is_mlb_team_d60_create_transaction(tx,team_id=tid,team_name=names[tid]): return False
-              if restricted_create(tx,tid): return False
-              if domain.is_contract_selected_transaction(tx): return True
-              if ri.is_mlb_team_d60_return_transaction(tx,team_id=tid,team_name=names[tid]): return True
-              if restricted_return(tx,tid): return True
-              if domain.is_claimed_off_waivers_transaction(tx) and to==tid: return True
-              if major_signing(tx,tid): return True
-              return None
+          counts=defaultdict(dict); changes=[]
+          for tid,_ in teams: counts[tid][START]=min(40,len(sets[tid]))
 
-          def prior_clear_state(tid,pid,current):
-              cd=infra.txn_date_obj(current); cid=infra.txn_id(current); state=None
-              for tx in player_team_events.get((tid,pid),[]):
-                  d=infra.txn_date_obj(tx); xid=infra.txn_id(tx)
-                  if not d or d>cd or (d==cd and xid>=cid): break
-                  st=clear_state(tx,tid)
-                  if st is not None: state=st
-              return state
+          d=START+timedelta(days=1)
+          while d<=END:
+              before={tid:set(sets[tid]) for tid,_ in teams}
 
-          counts=defaultdict(dict); diagnostics=[]
-          d=ANCHOR
-          while d>=COUNT_START:
-              # End-of-day count before undoing this day's moves.
-              for tid,_ in teams: counts[tid][d]=min(40,len(sets[tid]))
+              # Trades first in transaction-id order. Membership moves only when
+              # the player actually occupies a source 40-man spot.
+              for key,tx in sorted(trades[d].items(),key=lambda kv:kv[0][0]):
+                  pid=infra.extract_tx_player_id(tx); fr=infra._safe_int(infra._get_in(tx,'fromTeam','id')); to=infra._safe_int(infra._get_in(tx,'toTeam','id'))
+                  if pid and fr in sets and to in sets and pid in sets[fr]:
+                      sets[fr].discard(pid); sets[to].add(pid)
 
-              # Undo team-local transactions in reverse order.
               for tid,name in teams:
-                  evs=sorted(perday[d].get(tid,[]),key=lambda x:infra.txn_id(x),reverse=True)
-                  for tx in evs:
+                  for tx in sorted(perday[d].get(tid,[]),key=lambda x:infra.txn_id(x)):
                       pid=infra.extract_tx_player_id(tx); code=(tx.get('typeCode') or '').strip().upper(); desc=(tx.get('description') or '').lower()
                       fr=infra._safe_int(infra._get_in(tx,'fromTeam','id')); to=infra._safe_int(infra._get_in(tx,'toTeam','id'))
                       if not pid: continue
+
                       if domain.is_dfa_transaction(tx):
-                          sets[tid].add(pid)
+                          sets[tid].discard(pid)
                       elif ri.is_mlb_team_d60_create_transaction(tx,team_id=tid,team_name=name):
-                          sets[tid].add(pid)
-                      elif restricted_create(tx,tid):
-                          sets[tid].add(pid)
+                          sets[tid].discard(pid)
+                      elif restricted_off(tx,tid):
+                          sets[tid].discard(pid)
                       elif domain.is_contract_selected_transaction(tx):
-                          sets[tid].discard(pid)
+                          sets[tid].add(pid)
                       elif ri.is_mlb_team_d60_return_transaction(tx,team_id=tid,team_name=name):
-                          sets[tid].discard(pid)
-                      elif restricted_return(tx,tid):
-                          sets[tid].discard(pid)
+                          sets[tid].add(pid)
+                      elif restricted_on(tx,tid):
+                          sets[tid].add(pid)
                       elif domain.is_claimed_off_waivers_transaction(tx) and to==tid:
+                          # Source may already be off after DFA; the claiming team
+                          # nevertheless gains a 40-man player.
+                          sets[tid].add(pid)
+                      elif domain.is_outrighted_transaction(tx) or domain.is_released_transaction(tx):
+                          if team_desc(tx,tid): sets[tid].discard(pid)
+                      elif domain.is_claimed_off_waivers_transaction(tx) and fr==tid and to!=tid:
                           sets[tid].discard(pid)
                       elif major_signing(tx,tid):
-                          sets[tid].discard(pid)
-                      elif domain.is_outrighted_transaction(tx) or domain.is_released_transaction(tx) or (domain.is_claimed_off_waivers_transaction(tx) and fr==tid and to!=tid):
-                          # Final disposition after a prior DFA is count-neutral; a
-                          # direct outright/release/waiver claim is a 40-man removal.
-                          if is_team_desc(tx,tid) and prior_clear_state(tid,pid,tx) is not False:
-                              sets[tid].add(pid)
+                          sets[tid].add(pid)
 
-              # Undo trades globally after local moves. If the player occupies a
-              # destination 40-man spot after the trade, move that membership back.
-              for key,tx in sorted(trades_by_day[d].items(),key=lambda kv:kv[0][0],reverse=True):
-                  pid=infra.extract_tx_player_id(tx); fr=infra._safe_int(infra._get_in(tx,'fromTeam','id')); to=infra._safe_int(infra._get_in(tx,'toTeam','id'))
-                  if pid and fr in sets and to in sets and pid in sets[to]:
-                      sets[to].discard(pid); sets[fr].add(pid)
-              d-=timedelta(days=1)
+              for tid,name in teams:
+                  counts[tid][d]=min(40,len(sets[tid]))
+                  if len(sets[tid])>40:
+                      changes.append((d,name,'OVER40',len(sets[tid])))
+              d+=timedelta(days=1)
 
-          # Roll back Aug 18 and Aug 17 so Aug 16 reflects the requested window.
-          # The loop already records Aug16 after both later dates have been undone.
           rankings=[]
           for tid,name in teams:
-              open_days=sum(counts[tid][d]<40 for d in counts[tid] if COUNT_START<=d<=END)
-              rankings.append((open_days,tid,name))
+              rankings.append((sum(counts[tid][d]<40 for d in counts[tid]),tid,name))
 
-          print('\nREVERSE_LEDGER_RANKING')
-          for rank,(days,tid,name) in enumerate(sorted(rankings,key=lambda x:(-x[0],x[2])),1):
-              print(f'{rank:2d}. {name:24s} {days:3d}')
+          print('\nFORWARD_LEDGER_RANKING')
+          for rank,(days,tid,name) in enumerate(sorted(rankings,key=lambda x:(-x[0],x[2])),1): print(f'{rank:2d}. {name:24s} {days:3d}')
 
           print('\nATL_ANCHORS')
           atl=144
-          for q in [date(2026,3,25),date(2026,3,29),date(2026,3,30),date(2026,4,10),date(2026,4,11),date(2026,4,12),date(2026,4,13),date(2026,4,16),date(2026,4,17),date(2026,4,22),date(2026,4,23),date(2026,6,11),date(2026,6,12),date(2026,6,15),date(2026,6,16),date(2026,7,7),date(2026,8,1),date(2026,8,2),date(2026,8,3),date(2026,8,16)]:
-              print(q,counts[atl].get(q))
+          for q in [date(2026,3,25),date(2026,3,29),date(2026,3,30),date(2026,4,10),date(2026,4,11),date(2026,4,12),date(2026,4,13),date(2026,4,16),date(2026,4,17),date(2026,4,22),date(2026,4,23),date(2026,5,21),date(2026,5,22),date(2026,5,29),date(2026,6,1),date(2026,6,2),date(2026,6,10),date(2026,6,11),date(2026,6,12),date(2026,6,15),date(2026,6,16),date(2026,6,17),date(2026,7,7),date(2026,8,1),date(2026,8,2),date(2026,8,3),date(2026,8,16)]: print(q,counts[atl].get(q))
 
           print('\nATL_STREAKS')
-          st=None; prev=None
-          d=COUNT_START
+          st=None; prev=None; d=START
           while d<=END:
               if counts[atl][d]<40:
                   if st is None: st=d
@@ -209,15 +165,16 @@ jobs:
               d+=timedelta(days=1)
           if st is not None: print(st,prev,(prev-st).days+1,'min',min(counts[atl][x] for x in counts[atl] if st<=x<=prev))
 
-          print('\nSELECTED_TEAM_ANCHORS')
-          for tid,name in [(137,'San Francisco Giants'),(110,'Baltimore Orioles'),(135,'San Diego Padres'),(121,'New York Mets')]:
-              print(name,'Mar25',counts[tid].get(COUNT_START),'Aug16',counts[tid].get(END))
+          print('\nFINAL_COUNTS_AUG16')
+          for tid,name in sorted(teams,key=lambda x:x[1]): print(f'{name:24s} {counts[tid][END]:2d}')
+          print('\nOVER40_EVENTS',len(changes))
+          for x in changes[:100]: print(x)
           PY
       - name: Commit result
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add analysis-40man-reverse-ledger.txt
-          git commit -m "Temporary reverse-ledger result"
+          git add analysis-40man-forward-ledger.txt
+          git commit -m "Temporary forward-ledger result"
           git pull --rebase origin main
           git push origin main
