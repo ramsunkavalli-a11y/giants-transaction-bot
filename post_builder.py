@@ -660,6 +660,8 @@ def build_posts(new_txns, player_cache=None, season_mode=False, now_la=None):
     posts = []
     grouped_pending = []
     seen_rehab_assignments = set()
+    consumed_ids = set()
+    ordered_txns = sorted(new_txns, key=infra.txn_id)
 
     def flush_grouped():
         nonlocal grouped_pending
@@ -668,7 +670,9 @@ def build_posts(new_txns, player_cache=None, season_mode=False, now_la=None):
         posts.extend(infra.pack_posts(infra.build_date_group_blocks(grouped_pending)))
         grouped_pending = []
 
-    for tx in sorted(new_txns, key=infra.txn_id):
+    for index, tx in enumerate(ordered_txns):
+        if infra.txn_id(tx) in consumed_ids:
+            continue
         # Jersey-number changes are administrative noise, including the mass
         # Jackie Robinson Day switch to No. 42. Marking fetched IDs seen is
         # handled by bot.py even when this builder intentionally emits nothing.
@@ -697,6 +701,19 @@ def build_posts(new_txns, player_cache=None, season_mode=False, now_la=None):
             and infra._safe_int(infra._get_in(tx, "toTeam", "id")) == infra.TEAM_ID
         ):
             flush_grouped()
+            # A same-day claim immediately followed by an option is a single
+            # roster action in practice. Keep both official descriptions in
+            # one post so the state mapper can still represent both IDs.
+            paired_option = None
+            if index + 1 < len(ordered_txns):
+                candidate = ordered_txns[index + 1]
+                if (
+                    domain.is_optioned_transaction(candidate)
+                    and infra.txn_date(candidate) == infra.txn_date(tx)
+                    and infra.extract_tx_player_id(candidate) == infra.extract_tx_player_id(tx)
+                ):
+                    paired_option = candidate
+                    consumed_ids.add(infra.txn_id(candidate))
             base_text = infra.build_base_tx_text(tx)
             person_id = infra.extract_tx_player_id(tx)
             if not person_id:
@@ -705,14 +722,22 @@ def build_posts(new_txns, player_cache=None, season_mode=False, now_la=None):
             details = domain.fetch_player_details(person_id, cache=cache)
             tx_date = infra.txn_date_obj(tx) or now_la.date()
             enrichment = build_signing_enrichment(details, tx_date, cache=cache)
-            posts.append(
-                build_signing_post(
-                    base_text,
-                    infra.player_url(person_id),
-                    enrichment,
-                    max_len=infra.MAX_POST_LEN,
-                )
+            option_line = f"- {infra.txn_desc(paired_option)}" if paired_option else None
+            post_budget = infra.MAX_POST_LEN - len(option_line) - 1 if option_line else infra.MAX_POST_LEN
+            post = build_signing_post(
+                base_text,
+                infra.player_url(person_id),
+                enrichment,
+                max_len=post_budget,
             )
+            if paired_option:
+                lines = post.splitlines()
+                if lines and lines[-1] == infra.player_url(person_id):
+                    lines.insert(-1, option_line)
+                else:
+                    lines.append(option_line)
+                post = "\n".join(lines)
+            posts.append(post)
             continue
 
         category = domain.classify_transaction(tx, season_mode=season_mode)

@@ -229,27 +229,27 @@ def _acquisition_part(person_id: int, details: dict, tx: dict, cache) -> str | N
 
 
 def _forty_man_parts(tx: dict, cache) -> list[str]:
-    action = None
-    if domain.is_dfa_transaction(tx) or roster.is_mlb_team_d60_create_transaction(tx):
-        action = "Opens a 40-man spot"
-    elif domain.is_contract_selected_transaction(tx):
-        action = "Uses a 40-man spot"
-    elif _is_incoming_claim(tx):
-        action = "Uses a 40-man spot"
-    elif roster.is_mlb_team_d60_return_transaction(tx):
-        action = "Uses a 40-man spot"
-
-    if not action:
+    affects_40man = (
+        domain.is_dfa_transaction(tx)
+        or roster.is_mlb_team_d60_create_transaction(tx)
+        or domain.is_contract_selected_transaction(tx)
+        or _is_incoming_claim(tx)
+        or roster.is_mlb_team_d60_return_transaction(tx)
+    )
+    if not affects_40man:
         return []
     tx_date = infra.txn_date_obj(tx)
     count, additions, ok = roster.adjusted_40man_count(
         infra.TEAM_ID, as_of_date=tx_date, cache=cache
     )
     if not ok or count is None:
-        return [action]
+        return []
     if additions:
         print("40-man reconciliation additions:", additions)
-    return [action, f"40-man: {count}/40"]
+    # The after-move count says everything the directional phrase would say,
+    # without repeating that a selection, claim, DFA, or 60-day move changes
+    # the roster.
+    return [f"40-man: {count}/40"]
 
 
 def context_parts_for_transaction(tx: dict, cache=None, now_la=None) -> list[str]:
@@ -328,18 +328,29 @@ def enrich_posts(posts, new_txns, cache=None, now_la=None,
                  max_len=infra.MAX_POST_LEN):
     """Add context to posts that map cleanly to one transaction.
 
-    Grouped multi-transaction posts are intentionally left alone; attaching a
-    single roster consequence to a block of unrelated moves would be ambiguous.
+    Grouped multi-transaction posts are intentionally left alone, except a
+    same-player, same-day incoming claim followed by an option. That is one
+    connected move, so claim context (including the after-move 40-man count)
+    remains useful.
     """
     cache = cache if cache is not None else {}
     by_id = {infra.txn_id(tx): tx for tx in new_txns if infra.txn_id(tx)}
     enriched = []
     for post in posts:
         covered = infra.transaction_ids_represented_in_post(post, new_txns)
-        if len(covered) != 1:
-            enriched.append(post)
-            continue
-        tx = by_id.get(next(iter(covered)))
+        tx = None
+        if len(covered) == 1:
+            tx = by_id.get(next(iter(covered)))
+        elif len(covered) == 2:
+            paired = [by_id.get(txid) for txid in covered]
+            claim = next((item for item in paired if item and _is_incoming_claim(item)), None)
+            option = next((item for item in paired if item and domain.is_optioned_transaction(item)), None)
+            if (
+                claim and option
+                and infra.txn_date(claim) == infra.txn_date(option)
+                and infra.extract_tx_player_id(claim) == infra.extract_tx_player_id(option)
+            ):
+                tx = claim
         if not tx:
             enriched.append(post)
             continue

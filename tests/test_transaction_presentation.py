@@ -61,6 +61,32 @@ class TransactionPresentationTests(unittest.TestCase):
         self.assertIn("2026 AAA: 218 PA, .321/.424/.543", posts[0])
         self.assertIn("MLB: 19 PA | Age 27", posts[0])
 
+    def test_same_day_claim_and_option_share_one_post(self):
+        claim = {
+            "id": 3, "date": "2026-08-02", "typeCode": "CLW",
+            "description": "San Francisco Giants claimed 1B Test Player off waivers from Seattle Mariners.",
+            "person": {"id": 123, "fullName": "Test Player"},
+            "fromTeam": {"id": 136, "name": "Seattle Mariners"},
+            "toTeam": {"id": 137, "name": "San Francisco Giants"},
+        }
+        option = {
+            "id": 4, "date": "2026-08-02", "typeCode": "OPT",
+            "description": "San Francisco Giants optioned 1B Test Player to Sacramento River Cats.",
+            "person": {"id": 123, "fullName": "Test Player"},
+        }
+        enrichment = {
+            "pitcher": False, "age": 27, "primary_stats": None,
+            "primary_label": None, "secondary": None, "fallback": [],
+        }
+        with patch.object(post_builder.domain, "fetch_player_details", return_value={"id": 123}), \
+             patch.object(post_builder, "build_signing_enrichment", return_value=enrichment):
+            posts = post_builder.build_posts(
+                [claim, option], season_mode=True, now_la=datetime(2026, 8, 2)
+            )
+        self.assertEqual(len(posts), 1)
+        self.assertIn(claim["description"], posts[0])
+        self.assertIn(option["description"], posts[0])
+
     def test_outgoing_claim_remains_plain_grouped(self):
         claim = {
             "id": 4, "date": "2026-06-23", "typeCode": "CLW",

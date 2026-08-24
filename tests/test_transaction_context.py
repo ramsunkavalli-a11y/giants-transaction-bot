@@ -34,7 +34,7 @@ class TransactionContextTests(unittest.TestCase):
             parts = context.context_parts_for_transaction(current, cache={})
         self.assertEqual(
             parts,
-            ["First MLB call-up", "Uses a 40-man spot", "40-man: 39/40"],
+            ["First MLB call-up", "40-man: 39/40"],
         )
 
     def test_prior_mlb_debut_suppresses_first_callup(self):
@@ -65,7 +65,7 @@ class TransactionContextTests(unittest.TestCase):
             parts = context.context_parts_for_transaction(current, cache={})
         self.assertEqual(
             parts,
-            ["2nd DFA in 2026", "Opens a 40-man spot", "40-man: 39/40"],
+            ["2nd DFA in 2026", "40-man: 39/40"],
         )
 
     def test_60day_transfer_uses_original_il_start(self):
@@ -84,7 +84,7 @@ class TransactionContextTests(unittest.TestCase):
             parts = context.context_parts_for_transaction(current, cache={})
         self.assertEqual(
             parts,
-            ["Out since Jun 11", "Opens a 40-man spot", "40-man: 39/40"],
+            ["Out since Jun 11", "40-man: 39/40"],
         )
 
     def test_affiliate_60day_transfer_gets_no_40man_context(self):
@@ -123,7 +123,7 @@ class TransactionContextTests(unittest.TestCase):
             parts = context.context_parts_for_transaction(current, cache={})
         self.assertEqual(
             parts,
-            ["Returns after 61 days on IL", "Uses a 40-man spot", "40-man: 40/40"],
+            ["Returns after 61 days on IL", "40-man: 40/40"],
         )
 
     def test_claim_reports_dfa_acquisition_and_40man_context(self):
@@ -148,7 +148,6 @@ class TransactionContextTests(unittest.TestCase):
             [
                 "Claimed 3 days after DFA",
                 "ZiPS ROS: 92 wRC+",
-                "Uses a 40-man spot",
                 "40-man: 40/40",
             ],
         )
@@ -182,6 +181,28 @@ class TransactionContextTests(unittest.TestCase):
         self.assertEqual(len(enriched), 1)
         self.assertIn("MLB since Aug 1: 5 G, 20 PA\n2nd option in 2026\nhttps://", enriched[0])
         self.assertLessEqual(len(enriched[0]), 300)
+
+    def test_claim_option_pair_keeps_claim_context(self):
+        claim = {
+            "id": 140, "date": "2026-08-14", "typeCode": "CLW",
+            "description": "San Francisco Giants claimed LHP Test Player off waivers.",
+            "person": {"id": 123}, "toTeam": {"id": 137},
+        }
+        option = {
+            "id": 141, "date": "2026-08-14", "typeCode": "OPT",
+            "description": "San Francisco Giants optioned LHP Test Player to Sacramento River Cats.",
+            "person": {"id": 123},
+        }
+        post = (
+            "2026-08-14\n"
+            "- San Francisco Giants claimed LHP Test Player off waivers.\n"
+            "- San Francisco Giants optioned LHP Test Player to Sacramento River Cats.\n"
+            "https://www.mlb.com/player/123"
+        )
+        with patch.object(context, "context_parts_for_transaction", return_value=["40-man: 40/40"]) as parts:
+            enriched = context.enrich_posts([post], [claim, option], cache={})
+        self.assertIn("40-man: 40/40\nhttps://", enriched[0])
+        parts.assert_called_once_with(claim, cache={}, now_la=None)
 
 
 if __name__ == "__main__":
