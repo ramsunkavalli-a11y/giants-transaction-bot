@@ -202,6 +202,7 @@ def main():
         print("Not in MLB season mode; skipping 40-man daily post.")
         return
 
+    infra.require_state_files(STATE_PATH)
     today = now_la.date()
     state = load_state()
     if state.get("last_post_date") == today.isoformat():

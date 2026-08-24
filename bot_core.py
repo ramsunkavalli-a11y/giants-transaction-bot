@@ -32,9 +32,22 @@ except Exception:
 _CUTOFF_ENV = os.getenv("TXN_CUTOFF_DATE", "2026-02-21").strip()
 TXN_CUTOFF_DATE = datetime.strptime(_CUTOFF_ENV, "%Y-%m-%d").date()
 
-STATE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Production workflows check mutable state out from the dedicated bot-state
+# branch. Local runs default to the repository directory for convenience.
+STATE_DIR = os.environ.get("BOT_STATE_DIR") or os.path.dirname(os.path.abspath(__file__))
 LAST_ID_PATH = os.path.join(STATE_DIR, "last_id.txt")
 SEEN_IDS_PATH = os.path.join(STATE_DIR, "seen_ids.txt")
+
+
+def require_state_files(*paths: str):
+    """Fail safely instead of treating a missing production state checkout as empty."""
+    missing = [path for path in paths if not os.path.isfile(path)]
+    if missing:
+        raise RuntimeError(
+            "Production state is unavailable. Check out the bot-state branch "
+            "and set BOT_STATE_DIR before running a posting workflow. Missing: "
+            + ", ".join(missing)
+        )
 
 
 # -----------------------------

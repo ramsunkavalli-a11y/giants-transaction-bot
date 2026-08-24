@@ -28,7 +28,7 @@ The transaction bot:
 - Suppresses low-value administrative noise such as number changes and generic organizational assignments.
 - Posts to Bluesky.
 - Persists transaction IDs immediately after a successful Bluesky CreateRecord call so a later verification failure cannot cause duplicate posting.
-- Commits `last_id.txt` and `seen_ids.txt` back to `main` after each run when state changes.
+- Reads and writes production state on the dedicated `bot-state` branch, leaving `main` for production code.
 
 ### Performance context
 
@@ -179,7 +179,17 @@ These are production state and should not be deleted or manually reset casually:
 - `last_id.txt` — legacy/high-water checkpoint used alongside seen IDs.
 - `roster_daily_state.json` — last successful daily 40-man tracker post/state.
 
-The bot intentionally commits state to the repository so GitHub Actions runs remain idempotent without an external database.
+The bot intentionally commits state to the `bot-state` branch so GitHub Actions runs remain idempotent without an external database. `main` contains code only; do not manually reset the state branch casually.
+
+For a local posting run, check out `bot-state` separately and point `BOT_STATE_DIR` to that checkout. The entrypoints fail safely when their production-state files are absent instead of treating a missing checkout as new state.
+
+## Branches and workflow hygiene
+
+- **`main`** — production code. Use short-lived `feature/*` branches and pull requests for code changes.
+- **`bot-state`** — production state only. Scheduled workflows are the only intended writers.
+- **`audit/*`** — temporary reconciliation work, or preferably GitHub Actions artifacts; do not commit probes or generated audit output to `main`.
+
+The unit-test workflow runs for pushes to `main` and pull requests targeting it. The scheduled bot workflows serialize through a shared concurrency group before writing `bot-state`.
 
 ## GitHub Actions
 

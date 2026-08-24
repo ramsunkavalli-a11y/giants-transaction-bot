@@ -9,7 +9,8 @@ permissions:
   contents: write
 
 concurrency:
-  group: giants-transaction-bot
+  # Both production jobs update bot-state, so serialize them together.
+  group: giants-state
   cancel-in-progress: false   # don't cancel after posting but before committing state
 
 jobs:
@@ -20,6 +21,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          persist-credentials: true
+
+      - name: Checkout bot state
+        uses: actions/checkout@v4
+        with:
+          ref: bot-state
+          path: state
           fetch-depth: 0
           persist-credentials: true
 
@@ -36,18 +44,19 @@ jobs:
         env:
           BSKY_IDENTIFIER: ${{ secrets.BSKY_IDENTIFIER }}
           BSKY_APP_PASSWORD: ${{ secrets.BSKY_APP_PASSWORD }}
+          BOT_STATE_DIR: ${{ github.workspace }}/state
         run: |
           python bot.py
 
-      - name: Commit bot state (last_id.txt + seen_ids.txt)
+      - name: Commit bot state
         if: always()
+        working-directory: state
         run: |
           set -e
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Stage first so pull/rebase doesn't fail due to working tree changes
           git add last_id.txt seen_ids.txt
 
           # If nothing changed, stop cleanly
@@ -56,9 +65,6 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Update bot state"
-
-          # Integrate remote updates (rare with concurrency, but safe)
-          git pull --rebase origin main
-
-          git push origin main
+          git commit -m "Update transaction bot state"
+          git pull --rebase origin bot-state
+          git push origin HEAD:bot-state

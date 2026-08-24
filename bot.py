@@ -30,6 +30,7 @@ def record_successful_post(text, new_txns, seen_ids):
 def main():
     identifier = infra.os.environ["BSKY_IDENTIFIER"]
     app_password = infra.os.environ["BSKY_APP_PASSWORD"]
+    infra.require_state_files(infra.LAST_ID_PATH, infra.SEEN_IDS_PATH)
 
     last_posted_id = infra.load_last_id()
     seen_ids = infra.load_seen_ids()

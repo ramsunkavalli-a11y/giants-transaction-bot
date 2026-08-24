@@ -37,9 +37,11 @@ class PartialPostStateTests(unittest.TestCase):
         self.assertEqual(seen, {5, 30})
         save.assert_called_once_with({5, 30})
 
-    def test_production_workflow_commits_state_even_after_failure(self):
+    def test_production_workflow_commits_state_branch_even_after_failure(self):
         workflow = Path(".github/workflows/run.yml").read_text()
-        self.assertIn("- name: Commit bot state (last_id.txt + seen_ids.txt)\n        if: always()", workflow)
+        self.assertIn("- name: Commit bot state\n        if: always()\n        working-directory: state", workflow)
+        self.assertIn("ref: bot-state\n          path: state", workflow)
+        self.assertIn("git push origin HEAD:bot-state", workflow)
 
 
 if __name__ == "__main__":
